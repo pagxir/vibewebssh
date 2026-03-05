@@ -556,9 +556,9 @@ class SSHConnection {
         const payloadLength = len - paddingLength - 1;
         const payload = packet.slice(5, 5 + payloadLength);
         
+        this.incomingSeq++;
         console.log('About to call handlePacket with', payload.length, 'bytes (payload only)');
         await this.handlePacket(payload, packet);
-        this.incomingSeq++;
         return true;
     }
 
@@ -601,6 +601,8 @@ class SSHConnection {
         
         const decrypted = await this.incomingCipher.decrypt(encrypted);
         
+        this.debug(`Decrypted packet (first 20 bytes): ${Array.from(decrypted.slice(0, 20)).map(b => b.toString(16).padStart(2, '0')).join(' ')}`);
+        this.debug(`Incoming MAC check: seq=${this.incomingSeq}`);
         const expectedMac = await this.computeIncomingMac(this.incomingSeq, decrypted);
         if (expectedMac && arrayToHex(expectedMac) !== arrayToHex(mac)) {
             this.debug('MAC check failed');
@@ -615,8 +617,8 @@ class SSHConnection {
         const payloadLength = len - paddingLength - 1;
         const payload = decrypted.slice(5, 5 + payloadLength);
         
-        await this.handlePacket(payload, decrypted);
         this.incomingSeq++;
+        await this.handlePacket(payload, decrypted);
         return true;
     }
 
@@ -627,7 +629,10 @@ class SSHConnection {
         buf.appendInt32(seq);
         buf.append(data);
         
-        return await computeHMACSHA256(this.incomingMac.key, buf.toUint8Array());
+        const macData = buf.toUint8Array();
+        this.debug(`MAC input (${macData.length} bytes): seq=${seq}, dataLen=${data.length}`);
+        
+        return await computeHMACSHA256(this.incomingMac.key, macData);
     }
 
     async computeOutgoingMac(seq, data) {
@@ -664,6 +669,9 @@ class SSHConnection {
                 break;
             case SSH_MSG_USERAUTH_FAILURE:
                 this.handleAuthFailure(pkt);
+                break;
+            case SSH_MSG_USERAUTH_PK_OK:
+                await this.handlePkOk(pkt);
                 break;
             case SSH_MSG_USERAUTH_BANNER:
                 this.handleAuthBanner(pkt);
@@ -906,6 +914,618 @@ class SSHConnection {
                 }
             }, 50);
         });
+    }
+
+    async authenticateWithKey(username, privateKeyPem) {
+        this.debug(`Requesting userauth service...`);
+        this.requestService(SSH_SERVICE_USERAUTH);
+        
+        await new Promise((resolve) => {
+            const check = setInterval(() => {
+                if (this.serviceAccepted) {
+                    clearInterval(check);
+                    resolve();
+                }
+            }, 50);
+        });
+
+        this.debug(`Authenticating with key as ${username}...`);
+        
+        const keyData = await this.parsePrivateKey(privateKeyPem);
+        if (!keyData) {
+            throw new Error('Failed to parse private key');
+        }
+
+        this.pkAuthKeyData = keyData;
+        this.pkAuthUsername = username;
+        this.pkAuthPromiseResolve = null;
+        this.pkAuthPromiseReject = null;
+
+        const pubKeyBlob = this.buildPublicKeyBlob(keyData);
+        
+        const buf = new SSHBuffer();
+        buf.appendByte(SSH_MSG_USERAUTH_REQUEST);
+        buf.appendString(username);
+        buf.appendString(SSH_SERVICE_CONNECTION);
+        buf.appendString(SSH_AUTH_TYPE_PUBLICKEY);
+        buf.appendByte(0);
+        buf.appendString(keyData.keyType);
+        buf.appendBuffer(pubKeyBlob);
+        
+        this.sendPacket(buf.toUint8Array());
+
+        await new Promise((resolve, reject) => {
+            this.pkAuthPromiseResolve = resolve;
+            this.pkAuthPromiseReject = reject;
+            
+            setTimeout(() => {
+                if (this.pkAuthPromiseReject) {
+                    this.pkAuthPromiseReject(new Error('Key auth timeout'));
+                }
+            }, 10000);
+        });
+    }
+
+    async handlePkOk(pkt) {
+        this.debug('Server accepts public key, signing...');
+        
+        const keyData = this.pkAuthKeyData;
+        const username = this.pkAuthUsername;
+
+        const pubKeyBlob = this.buildPublicKeyBlob(keyData);
+
+        const sessionData = new SSHBuffer();
+        sessionData.appendBuffer(this.sessionId);
+        sessionData.appendByte(SSH_MSG_USERAUTH_REQUEST);
+        sessionData.appendString(username);
+        sessionData.appendString(SSH_SERVICE_CONNECTION);
+        sessionData.appendString(SSH_AUTH_TYPE_PUBLICKEY);
+        sessionData.appendByte(1);
+        sessionData.appendString(keyData.keyType);
+        sessionData.appendBuffer(pubKeyBlob);
+
+        const dataToSign = sessionData.toUint8Array();
+
+        this.debug(`Data to sign (${dataToSign.length} bytes): ${Array.from(dataToSign.slice(0, 40)).map(b => b.toString(16).padStart(2, '0')).join(' ')}...`);
+        this.debug(`Session ID: ${Array.from(this.sessionId).map(b => b.toString(16).padStart(2, '0')).join(' ')}`);
+        this.debug(`Public key: ${Array.from(keyData.pubKey).map(b => b.toString(16).padStart(2, '0')).join(' ')}`);
+
+        let signature;
+        try {
+            signature = await this.signWithKey(keyData, dataToSign);
+            this.debug(`Signature (${signature.length} bytes): ${Array.from(signature).map(b => b.toString(16).padStart(2, '0')).join(' ')}`);
+        } catch (e) {
+            this.debug('Signing failed: ' + e.message);
+            if (this.pkAuthPromiseReject) {
+                this.pkAuthPromiseReject(new Error('Signing failed: ' + e.message));
+            }
+            return;
+        }
+
+        const sigBlob = new SSHBuffer();
+        sigBlob.appendString(keyData.sigAlg || keyData.keyType);
+        sigBlob.appendBuffer(signature);
+
+        const buf = new SSHBuffer();
+        buf.appendByte(SSH_MSG_USERAUTH_REQUEST);
+        buf.appendString(username);
+        buf.appendString(SSH_SERVICE_CONNECTION);
+        buf.appendString(SSH_AUTH_TYPE_PUBLICKEY);
+        buf.appendByte(1);
+        buf.appendString(keyData.keyType);
+        buf.appendBuffer(pubKeyBlob);
+        buf.appendBuffer(sigBlob.toUint8Array());
+
+        this.sendPacket(buf.toUint8Array());
+
+        await new Promise((resolve, reject) => {
+            const check = setInterval(() => {
+                if (this.authenticated) {
+                    clearInterval(check);
+                    if (this.pkAuthPromiseResolve) {
+                        this.pkAuthPromiseResolve();
+                    }
+                    resolve();
+                } else if (this.authFailed) {
+                    clearInterval(check);
+                    if (this.pkAuthPromiseReject) {
+                        this.pkAuthPromiseReject(new Error('Key authentication failed'));
+                    }
+                    reject(new Error('Key authentication failed'));
+                }
+            }, 50);
+        });
+    }
+
+    buildPublicKeyBlob(keyData) {
+        const buf = new SSHBuffer();
+        
+        if (keyData.keyType === 'ssh-rsa') {
+            buf.appendString(keyData.keyType);
+            buf.appendBuffer(keyData.e);
+            buf.appendBuffer(keyData.n);
+        } else if (keyData.keyType.startsWith('ecdsa-sha2-')) {
+            buf.appendString(keyData.keyType);
+            buf.appendString(keyData.curve);
+            buf.appendBuffer(keyData.Q);
+        } else if (keyData.keyType === 'ssh-ed25519') {
+            buf.appendString(keyData.keyType);
+            buf.appendBuffer(keyData.pubKey);
+        }
+        
+        return buf.toUint8Array();
+    }
+
+    async signWithKey(keyData, data) {
+        if (keyData.keyType === 'ssh-rsa') {
+            const hash = 'SHA-256';
+            keyData.sigAlg = 'rsa-sha2-256';
+            
+            const cryptoKey = await crypto.subtle.importKey(
+                'pkcs8',
+                keyData.pkcs8,
+                { name: 'RSASSA-PKCS1-v1_5', hash: hash },
+                false,
+                ['sign']
+            );
+            
+            const sig = await crypto.subtle.sign(
+                'RSASSA-PKCS1-v1_5',
+                cryptoKey,
+                data
+            );
+            
+            return new Uint8Array(sig);
+        } else if (keyData.keyType.startsWith('ecdsa-sha2-')) {
+            const cryptoKey = await crypto.subtle.importKey(
+                'pkcs8',
+                keyData.pkcs8,
+                { name: 'ECDSA', namedCurve: keyData.namedCurve },
+                false,
+                ['sign']
+            );
+            
+            const sigRaw = await crypto.subtle.sign(
+                { name: 'ECDSA', hash: 'SHA-256' },
+                cryptoKey,
+                data
+            );
+            
+            return this.ecdsaSigToSSH(new Uint8Array(sigRaw));
+        } else if (keyData.keyType === 'ssh-ed25519') {
+            keyData.sigAlg = 'ssh-ed25519';
+            
+            this.debug(`Ed25519 signing: dataLen=${data.length}, privKeyLen=${keyData.fullPrivKey.length}`);
+            this.debug(`Ed25519 privKey (first 16): ${Array.from(keyData.fullPrivKey.slice(0, 16)).map(b => b.toString(16).padStart(2, '0')).join(' ')}`);
+            
+            const sig = nacl.sign.detached(new Uint8Array(data), keyData.fullPrivKey);
+            this.debug(`Ed25519 sig: ${Array.from(sig).map(b => b.toString(16).padStart(2, '0')).join(' ')}`);
+            return sig;
+        }
+        
+        throw new Error('Unsupported key type: ' + keyData.keyType);
+    }
+
+    ecdsaSigToSSH(sig) {
+        const len = sig.length / 2;
+        let r = sig.slice(0, len);
+        let s = sig.slice(len);
+        
+        while (r.length > 1 && r[0] === 0 && !(r[1] & 0x80)) r = r.slice(1);
+        while (s.length > 1 && s[0] === 0 && !(s[1] & 0x80)) s = s.slice(1);
+        
+        if (r[0] & 0x80) r = this.concatUint8(new Uint8Array([0]), r);
+        if (s[0] & 0x80) s = this.concatUint8(new Uint8Array([0]), s);
+        
+        const buf = new SSHBuffer();
+        buf.appendBuffer(r);
+        buf.appendBuffer(s);
+        
+        return buf.toUint8Array();
+    }
+
+    async parsePrivateKey(pem) {
+        pem = pem.trim();
+        
+        if (pem.includes('-----BEGIN OPENSSH PRIVATE KEY-----')) {
+            return this.parseOpenSSHKey(pem);
+        } else if (pem.includes('-----BEGIN RSA PRIVATE KEY-----')) {
+            return this.parseRSAKey(pem);
+        } else if (pem.includes('-----BEGIN EC PRIVATE KEY-----')) {
+            return this.parseECKey(pem);
+        } else if (pem.includes('-----BEGIN PRIVATE KEY-----')) {
+            return this.parsePKCS8Key(pem);
+        }
+        
+        throw new Error('Unsupported key format');
+    }
+
+    parseOpenSSHKey(pem) {
+        const b64 = pem.replace(/-----BEGIN OPENSSH PRIVATE KEY-----/, '')
+                       .replace(/-----END OPENSSH PRIVATE KEY-----/, '')
+                       .replace(/\s/g, '');
+        
+        const raw = this.base64ToUint8(b64);
+        
+        const authMagic = new TextEncoder().encode('openssh-key-v1\0');
+        if (raw.slice(0, authMagic.length).join(',') !== authMagic.join(',')) {
+            throw new Error('Invalid OpenSSH key');
+        }
+        
+        let offset = authMagic.length;
+        
+        const readOpenSSHString = () => {
+            const len = (raw[offset] << 24) | (raw[offset+1] << 16) | (raw[offset+2] << 8) | raw[offset+3];
+            offset += 4;
+            const str = raw.slice(offset, offset + len);
+            offset += len;
+            return str;
+        };
+        
+        const cipherName = new TextDecoder().decode(readOpenSSHString());
+        const kdfName = new TextDecoder().decode(readOpenSSHString());
+        
+        if (cipherName !== 'none' || kdfName !== 'none') {
+            throw new Error('Encrypted keys not supported');
+        }
+        
+        const kdfOpts = readOpenSSHString();
+        const numKeys = (raw[offset] << 24) | (raw[offset+1] << 16) | (raw[offset+2] << 8) | raw[offset+3];
+        offset += 4;
+        
+        const pubKey = readOpenSSHString();
+        
+        const privSectionLen = (raw[offset] << 24) | (raw[offset+1] << 16) | (raw[offset+2] << 8) | raw[offset+3];
+        offset += 4;
+        
+        const check1 = (raw[offset] << 24) | (raw[offset+1] << 16) | (raw[offset+2] << 8) | raw[offset+3];
+        offset += 4;
+        const check2 = (raw[offset] << 24) | (raw[offset+1] << 16) | (raw[offset+2] << 8) | raw[offset+3];
+        offset += 4;
+        
+        if (check1 !== check2) {
+            throw new Error('Key checksum failed');
+        }
+        
+        const keyTypeBytes = readOpenSSHString();
+        console.log('Key type bytes:', Array.from(keyTypeBytes).map(b => b.toString(16).padStart(2, '0')).join(' '));
+        const keyType = new TextDecoder().decode(keyTypeBytes);
+        console.log('Key type:', keyType, 'length:', keyType.length);
+        console.log('Current offset after keyType:', offset);
+        
+        if (keyType === 'ssh-rsa') {
+            const n = readOpenSSHString();
+            const e = readOpenSSHString();
+            const d = readOpenSSHString();
+            const iqmp = readOpenSSHString();
+            const p = readOpenSSHString();
+            const q = readOpenSSHString();
+            
+            return this.buildRSAKeyFromParts(n, e, d, p, q);
+        } else if (keyType.startsWith('ecdsa-sha2-')) {
+            const curve = new TextDecoder().decode(readOpenSSHString());
+            const Q = readOpenSSHString();
+            const d = readOpenSSHString();
+            
+            return this.buildECKeyFromParts(keyType, curve, Q, d);
+        } else if (keyType === 'ssh-ed25519') {
+            const pubKey = readOpenSSHString();
+            const privKey = readOpenSSHString();
+            const comment = readOpenSSHString();
+            
+            console.log('Ed25519 pubKey length:', pubKey.length);
+            console.log('Ed25519 privKey length:', privKey.length);
+            
+            return {
+                keyType: 'ssh-ed25519',
+                pubKey: pubKey,
+                privKey: privKey.slice(0, 32),
+                fullPrivKey: privKey
+            };
+        }
+        
+        throw new Error('Unsupported key type: ' + keyType);
+    }
+
+    buildRSAKeyFromParts(n, e, d, p, q) {
+        const nInt = this.bytesToBigInt(n);
+        const eInt = this.bytesToBigInt(e);
+        const dInt = this.bytesToBigInt(d);
+        const pInt = this.bytesToBigInt(p);
+        const qInt = this.bytesToBigInt(q);
+        
+        const dp = dInt % (pInt - 1n);
+        const dq = dInt % (qInt - 1n);
+        const qinv = this.modInverse(qInt, pInt);
+        
+        const nBytes = this.intToBytes(nInt);
+        const eBytes = this.intToBytes(eInt);
+        const dBytes = this.intToBytes(dInt);
+        const pBytes = this.intToBytes(pInt);
+        const qBytes = this.intToBytes(qInt);
+        const dpBytes = this.intToBytes(dp);
+        const dqBytes = this.intToBytes(dq);
+        const qinvBytes = this.intToBytes(qinv);
+        
+        const version = new Uint8Array([0]);
+        
+        const seq = this.buildDERSequence([
+            version,
+            this.buildDERInteger(nBytes),
+            this.buildDERInteger(eBytes),
+            this.buildDERInteger(dBytes),
+            this.buildDERInteger(pBytes),
+            this.buildDERInteger(qBytes),
+            this.buildDERInteger(dpBytes),
+            this.buildDERInteger(dqBytes),
+            this.buildDERInteger(qinvBytes)
+        ]);
+        
+        const pkcs8 = this.buildPKCS8RSA(nBytes, eBytes, dBytes, pBytes, qBytes, dpBytes, dqBytes, qinvBytes);
+        
+        return {
+            keyType: 'ssh-rsa',
+            n: n,
+            e: e,
+            pkcs8: pkcs8
+        };
+    }
+
+    buildPKCS8RSA(n, e, d, p, q, dp, dq, qinv) {
+        const version = new Uint8Array([0x02, 0x01, 0x00]);
+        
+        const algId = new Uint8Array([
+            0x30, 0x0d,
+            0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01,
+            0x05, 0x00
+        ]);
+        
+        const rsapriv = this.buildDERSequence([
+            this.buildDERInteger(new Uint8Array([0])),
+            this.buildDERInteger(n),
+            this.buildDERInteger(e),
+            this.buildDERInteger(d),
+            this.buildDERInteger(p),
+            this.buildDERInteger(q),
+            this.buildDERInteger(dp),
+            this.buildDERInteger(dq),
+            this.buildDERInteger(qinv)
+        ]);
+        
+        const octetString = new Uint8Array(4 + rsapriv.length);
+        octetString[0] = 0x04;
+        octetString[1] = 0x82;
+        octetString[2] = (rsapriv.length >> 8) & 0xff;
+        octetString[3] = rsapriv.length & 0xff;
+        octetString.set(rsapriv, 4);
+        
+        const total = version.length + algId.length + octetString.length;
+        const result = new Uint8Array(4 + total);
+        result[0] = 0x30;
+        result[1] = 0x82;
+        result[2] = (total >> 8) & 0xff;
+        result[3] = total & 0xff;
+        result.set(version, 4);
+        result.set(algId, 4 + version.length);
+        result.set(octetString, 4 + version.length + algId.length);
+        
+        return result;
+    }
+
+    buildECKeyFromParts(keyType, curve, Q, d) {
+        let namedCurve;
+        if (curve === 'nistp256') namedCurve = 'P-256';
+        else if (curve === 'nistp384') namedCurve = 'P-384';
+        else if (curve === 'nistp521') namedCurve = 'P-521';
+        else throw new Error('Unsupported curve: ' + curve);
+        
+        const pkcs8 = this.buildPKCS8EC(keyType, curve, Q, d);
+        
+        return {
+            keyType: keyType,
+            curve: curve,
+            namedCurve: namedCurve,
+            Q: Q,
+            d: d,
+            pkcs8: pkcs8
+        };
+    }
+
+    buildPKCS8EC(keyType, curve, Q, d) {
+        const version = new Uint8Array([0x02, 0x01, 0x00]);
+        
+        const curveOid = curve === 'nistp256' ? new Uint8Array([0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07]) :
+                         curve === 'nistp384' ? new Uint8Array([0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x22]) :
+                         new Uint8Array([0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x23]);
+        
+        const algIdLen = 2 + curveOid.length + 2;
+        const algId = new Uint8Array(algIdLen);
+        algId[0] = 0x30;
+        algId[1] = algIdLen - 2;
+        algId[2] = 0x06;
+        algId[3] = curveOid.length - 2;
+        algId.set(curveOid.slice(2), 4);
+        
+        const ecOid = new Uint8Array([0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01]);
+        const fullAlgId = this.concatUint8(
+            new Uint8Array([0x30, ecOid.length + curveOid.length + 4]),
+            this.concatUint8(ecOid, curveOid)
+        );
+        
+        const ecPriv = new Uint8Array(7 + d.length + 4 + Q.length);
+        let off = 0;
+        ecPriv[off++] = 0x30;
+        const innerLen = 3 + d.length + 4 + Q.length;
+        ecPriv[off++] = (innerLen >> 8) & 0xff;
+        ecPriv[off++] = innerLen & 0xff;
+        ecPriv[off++] = 0x02;
+        ecPriv[off++] = 0x01;
+        ecPriv[off++] = 0x01;
+        ecPriv[off++] = 0x04;
+        ecPriv[off++] = d.length;
+        ecPriv.set(d, off);
+        off += d.length;
+        ecPriv[off++] = 0xa1;
+        ecPriv[off++] = 0x03;
+        ecPriv[off++] = 0x02;
+        ecPriv[off++] = 0x01;
+        ecPriv[off++] = 0x00;
+        ecPriv.set(Q, off);
+        
+        const total = version.length + fullAlgId.length + 4 + ecPriv.length;
+        const result = new Uint8Array(4 + total);
+        result[0] = 0x30;
+        result[1] = 0x82;
+        result[2] = (total >> 8) & 0xff;
+        result[3] = total & 0xff;
+        result.set(version, 4);
+        result.set(fullAlgId, 4 + version.length);
+        
+        const octetHeader = new Uint8Array([0x04, 0x82, (ecPriv.length >> 8) & 0xff, ecPriv.length & 0xff]);
+        result.set(octetHeader, 4 + version.length + fullAlgId.length);
+        result.set(ecPriv, 4 + version.length + fullAlgId.length + octetHeader.length);
+        
+        return result;
+    }
+
+    parseRSAKey(pem) {
+        const b64 = pem.replace(/-----BEGIN RSA PRIVATE KEY-----/, '')
+                       .replace(/-----END RSA PRIVATE KEY-----/, '')
+                       .replace(/\s/g, '');
+        
+        const der = this.base64ToUint8(b64);
+        
+        const { n, e, d, p, q } = this.parseRSADer(der);
+        
+        return this.buildRSAKeyFromParts(n, e, d, p, q);
+    }
+
+    parseRSADer(der) {
+        let offset = 0;
+        
+        const parseDerInt = () => {
+            if (der[offset] !== 0x30) return null;
+            offset++;
+            const lenBytes = der[offset] & 0x80 ? der[offset] - 0x80 : 0;
+            offset++;
+            let len = 0;
+            for (let i = 0; i < lenBytes; i++) {
+                len = (len << 8) | der[offset++];
+            }
+            if (lenBytes === 0) len = der[offset - 1];
+            
+            const items = [];
+            while (offset < der.length) {
+                if (der[offset] !== 0x02) break;
+                offset++;
+                let intLen = der[offset++];
+                if (intLen & 0x80) {
+                    const bytes = intLen - 0x80;
+                    intLen = 0;
+                    for (let i = 0; i < bytes; i++) {
+                        intLen = (intLen << 8) | der[offset++];
+                    }
+                }
+                const val = der.slice(offset, offset + intLen);
+                offset += intLen;
+                items.push(val);
+            }
+            return items;
+        };
+        
+        const ints = parseDerInt();
+        if (!ints || ints.length < 9) {
+            throw new Error('Invalid RSA key DER');
+        }
+        
+        return {
+            n: ints[1],
+            e: ints[2],
+            d: ints[3],
+            p: ints[4],
+            q: ints[5]
+        };
+    }
+
+    parseECKey(pem) {
+        const b64 = pem.replace(/-----BEGIN EC PRIVATE KEY-----/, '')
+                       .replace(/-----END EC PRIVATE KEY-----/, '')
+                       .replace(/\s/g, '');
+        
+        const der = this.base64ToUint8(b64);
+        
+        throw new Error('EC private key parsing not yet implemented. Use OpenSSH format.');
+    }
+
+    parsePKCS8Key(pem) {
+        const b64 = pem.replace(/-----BEGIN PRIVATE KEY-----/, '')
+                       .replace(/-----END PRIVATE KEY-----/, '')
+                       .replace(/\s/g, '');
+        
+        const der = this.base64ToUint8(b64);
+        
+        throw new Error('PKCS#8 parsing not yet implemented. Use OpenSSH or RSA format.');
+    }
+
+    buildDERInteger(val) {
+        if (val[0] & 0x80) {
+            val = this.concatUint8(new Uint8Array([0]), val);
+        }
+        
+        const result = new Uint8Array(2 + val.length);
+        result[0] = 0x02;
+        result[1] = val.length;
+        result.set(val, 2);
+        return result;
+    }
+
+    buildDERSequence(items) {
+        let total = 0;
+        for (const item of items) {
+            total += item.length;
+        }
+        
+        const result = new Uint8Array(4 + total);
+        result[0] = 0x30;
+        result[1] = 0x82;
+        result[2] = (total >> 8) & 0xff;
+        result[3] = total & 0xff;
+        
+        let offset = 4;
+        for (const item of items) {
+            result.set(item, offset);
+            offset += item.length;
+        }
+        
+        return result;
+    }
+
+    intToBytes(bi) {
+        let hex = bi.toString(16);
+        if (hex.length % 2) hex = '0' + hex;
+        return hexToArray(hex);
+    }
+
+    modInverse(a, m) {
+        let [old_r, r] = [a, m];
+        let [old_s, s] = [1n, 0n];
+        
+        while (r !== 0n) {
+            const q = old_r / r;
+            [old_r, r] = [r, old_r - q * r];
+            [old_s, s] = [s, old_s - q * s];
+        }
+        
+        return ((old_s % m) + m) % m;
+    }
+
+    base64ToUint8(b64) {
+        const binary = atob(b64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) {
+            bytes[i] = binary.charCodeAt(i);
+        }
+        return bytes;
     }
 
     handleAuthSuccess() {

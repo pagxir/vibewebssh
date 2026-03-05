@@ -22,7 +22,8 @@
             border-bottom: 1px solid #3d3d3d;
             flex-wrap: wrap;
         }
-        #connection-panel input {
+        #connection-panel input[type="text"],
+        #connection-panel input[type="password"] {
             padding: 8px;
             border: 1px solid #3d3d3d;
             border-radius: 4px;
@@ -34,12 +35,17 @@
             outline: none;
             border-color: #007acc;
         }
-        #host { width: 150px; }
-        #port { width: 80px; }
-        #username { width: 120px; }
-        #password { width: 150px; }
+        #connection-panel label {
+            color: #888;
+            font-size: 13px;
+        }
+        #host { width: 140px; }
+        #port { width: 70px; }
+        #username { width: 100px; }
+        #password { width: 120px; }
+        #keyfile { display: none; }
         .btn {
-            padding: 8px 20px;
+            padding: 8px 16px;
             border: none;
             border-radius: 4px;
             cursor: pointer;
@@ -60,15 +66,57 @@
             opacity: 0.5;
             cursor: not-allowed;
         }
+        .btn-small {
+            padding: 6px 12px;
+            font-size: 13px;
+            background: #444;
+            color: #fff;
+        }
+        .btn-small:hover { background: #555; }
         #status {
-            margin-left: auto;
             color: #888;
             font-size: 14px;
+            min-width: 100px;
         }
         #status.connected { color: #48bb78; }
         #status.error { color: #f56565; }
         #terminal { flex: 1; padding: 10px; }
         .xterm { padding: 5px; }
+        .auth-methods {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            margin-left: 10px;
+            padding-left: 10px;
+            border-left: 1px solid #3d3d3d;
+        }
+        .auth-methods label {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            cursor: pointer;
+            color: #888;
+            font-size: 13px;
+        }
+        .auth-methods input[type="radio"] {
+            cursor: pointer;
+        }
+        .auth-methods input[type="radio"]:checked + span {
+            color: #fff;
+        }
+        #key-section {
+            display: none;
+            align-items: center;
+            gap: 8px;
+        }
+        #key-info {
+            color: #888;
+            font-size: 12px;
+            max-width: 150px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
     </style>
 </head>
 <body>
@@ -76,23 +124,46 @@
         <label>Host:</label>
         <input type="text" id="host" value="127.0.0.1" placeholder="IP Address">
         <label>Port:</label>
-        <input type="text" id="port" value="22" placeholder="Port">
+        <input type="text" id="port" value="22" placeholder="22">
         <label>User:</label>
         <input type="text" id="username" value="root" placeholder="Username">
-        <label>Pass:</label>
-        <input type="password" id="password" value="" placeholder="Password">
-        <button class="btn btn-connect" id="connectBtn" onclick="connect()">Connect</button>
-        <button class="btn btn-disconnect" id="disconnectBtn" onclick="disconnect()" disabled>Disconnect</button>
-        <span id="status">Disconnected</span>
+        
+        <div id="password-section">
+            <label>Pass:</label>
+            <input type="password" id="password" placeholder="Password">
+        </div>
+        
+        <div id="key-section">
+            <button class="btn btn-small" onclick="document.getElementById('keyfile').click()">选择私钥</button>
+            <input type="file" id="keyfile" accept=".pem,.key,id_rsa,id_ed25519" onchange="loadKeyFile(event)">
+            <span id="key-info">未选择</span>
+        </div>
+        
+        <div class="auth-methods">
+            <label>
+                <input type="radio" name="auth-method" value="password" checked onchange="updateAuthMode()">
+                <span>密码</span>
+            </label>
+            <label>
+                <input type="radio" name="auth-method" value="key" onchange="updateAuthMode()">
+                <span>密钥</span>
+            </label>
+        </div>
+        
+        <button class="btn btn-connect" id="connectBtn" onclick="connect()">连接</button>
+        <button class="btn btn-disconnect" id="disconnectBtn" onclick="disconnect()" disabled>断开</button>
+        <span id="status">未连接</span>
     </div>
     <div id="terminal"></div>
     <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/tweetnacl/1.0.3/nacl-fast.min.js"></script>
     <script src="ssh.js"></script>
     <script>
         let ssh = null;
         let term = null;
         let fitAddon = null;
+        let privateKeyData = null;
 
         term = new Terminal({
             cursorBlink: true,
@@ -120,7 +191,6 @@
             status.className = type || '';
         }
 
-        
         function setButtons(connected) {
             document.getElementById('connectBtn').disabled = connected;
             document.getElementById('disconnectBtn').disabled = !connected;
@@ -128,17 +198,47 @@
             document.getElementById('port').disabled = connected;
             document.getElementById('username').disabled = connected;
             document.getElementById('password').disabled = connected;
+            document.getElementById('keyfile').disabled = connected;
         }
 
-        
+        function updateAuthMode() {
+            const authMethod = document.querySelector('input[name="auth-method"]:checked').value;
+            document.getElementById('password-section').style.display = authMethod === 'password' ? 'inline' : 'none';
+            document.getElementById('key-section').style.display = authMethod === 'key' ? 'flex' : 'none';
+        }
+
+        function loadKeyFile(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+            
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                privateKeyData = e.target.result;
+                document.getElementById('key-info').textContent = file.name;
+                document.getElementById('key-info').title = file.name;
+            };
+            reader.readAsText(file);
+        }
+
         async function connect() {
             const host = document.getElementById('host').value.trim();
             const port = document.getElementById('port').value.trim();
             const username = document.getElementById('username').value.trim();
             const password = document.getElementById('password').value;
+            const authMethod = document.querySelector('input[name="auth-method"]:checked').value;
 
-            if (!host || !port || !username || !password) {
-                updateStatus('Please fill all fields', 'error');
+            if (!host || !port || !username) {
+                updateStatus('请填写主机、端口和用户名', 'error');
+                return;
+            }
+
+            if (authMethod === 'password' && !password) {
+                updateStatus('请输入密码', 'error');
+                return;
+            }
+
+            if (authMethod === 'key' && !privateKeyData) {
+                updateStatus('请选择私钥文件', 'error');
                 return;
             }
 
@@ -147,7 +247,7 @@
             }
 
             term.clear();
-            updateStatus('Connecting...', '');
+            updateStatus('连接中...', '');
             
             try {
                 const wsUrl = `wss://claw.603030.xyz:8443/websockify?host=${encodeURIComponent(host)}&port=${encodeURIComponent(port)}`;
@@ -160,9 +260,9 @@
                 };
                 
                 ssh.onClose = () => {
-                    updateStatus('Disconnected', '');
+                    updateStatus('已断开', '');
                     setButtons(false);
-                    term.write('\r\n\x1b[31mDisconnected\x1b[0m\r\n');
+                    term.write('\r\n\x1b[31m连接已断开\x1b[0m\r\n');
                 };
 
                 ssh.onDebug = (msg) => {
@@ -170,13 +270,16 @@
                 };
 
                 await ssh.connect();
-                updateStatus('Authenticating...', '');
+                updateStatus('认证中...', '');
                 
-                await ssh.authenticate(username, password);
-                updateStatus('Connected', 'connected');
+                if (authMethod === 'key') {
+                    await ssh.authenticateWithKey(username, privateKeyData);
+                } else {
+                    await ssh.authenticate(username, password);
+                }
+                
+                updateStatus('已连接', 'connected');
                 setButtons(true);
-                
-                term.write('\r\n\x1b[32mSSH session established\x1b[0m\r\n');
                 
                 const rows = term.rows;
                 const cols = term.cols;
@@ -186,8 +289,8 @@
                 
             } catch (error) {
                 console.error('Connection error:', error);
-                updateStatus('Connection failed', 'error');
-                term.write('\r\n\x1b[31mError: ' + error.message + '\x1b[0m\r\n');
+                updateStatus('连接失败', 'error');
+                term.write('\r\n\x1b[31m错误: ' + error.message + '\x1b[0m\r\n');
                 setButtons(false);
             }
         }
