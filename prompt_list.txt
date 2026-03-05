@@ -1,0 +1,113 @@
+# WebSSH 项目开发 Prompt 记录
+
+## 1. 项目初始化
+What did we do so far?
+
+## 2. 继续开发
+Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed.
+
+## 3. 调试 Ed25519 密钥解析
+[SSH Debug logs showing Ed25519 key parsing and authentication flow]
+
+## 4. 继续调试 MAC 检查失败
+[SSH Debug logs showing MAC check failure with sequence number issues]
+
+## 5. 修复序列号问题后继续测试
+[SSH Debug logs showing successful MAC check but authentication failure]
+
+## 6. 修复 Session ID 序列化问题后测试成功
+[SSH Debug logs showing successful Ed25519 authentication]
+
+## 7. 添加 README 文档
+Now, key auth is login success. please add readme markdown for this project.
+
+## 8. 添加中文文档
+再添加一个中文版本的markdown，讲讲项目介绍，工作原理，使用说明
+
+## 9. 保存 Prompt 列表
+再把我写的这些prompt保存成文件prompt_list.txt
+
+---
+
+## 项目开发历程总结
+
+### 第一阶段：问题诊断
+- 发现 Ed25519 密钥解析失败（keyType 为空）
+- 定位到 `numKeys` 解析错误（应为 uint32，实际只读了 1 字节）
+
+### 第二阶段：Ed25519 支持
+- 添加 TweetNaCl.js 库支持 Ed25519 签名
+- 实现 Ed25519 密钥解析和签名
+
+### 第三阶段：MAC 检查失败
+- 发现序列号竞争条件问题
+- `handlePacket` 可能在 `incomingSeq++` 之前触发新的消息处理
+- 修复：在调用 `handlePacket` 之前先递增 `incomingSeq`
+
+### 第四阶段：签名数据错误
+- 发现 Session ID 被错误序列化为逗号分隔字符串
+- 原因：`appendString` 对 Uint8Array 调用 `TextEncoder.encode()` 会先转为字符串
+- 修复：使用 `appendBuffer` 代替 `appendString`
+
+### 第五阶段：文档完善
+- 添加英文 README.md
+- 添加中文 README_CN.md
+- 保存开发 prompt 记录
+
+---
+
+## 关键 Bug 修复
+
+### Bug 1: Ed25519 密钥解析失败
+**问题**：`Unsupported key type: ` (空字符串)
+**原因**：`numKeys` 读取错误，导致后续偏移量错位
+**修复**：
+```javascript
+// 错误
+const numKeys = raw[offset++];
+offset++;
+
+// 正确
+const numKeys = (raw[offset] << 24) | (raw[offset+1] << 16) | 
+                (raw[offset+2] << 8) | raw[offset+3];
+offset += 4;
+```
+
+### Bug 2: MAC 检查失败（序列号竞争）
+**问题**：收到签名响应时 MAC 检查失败，序列号错误
+**原因**：`handlePacket` 发送数据包后，服务器立即响应，但 `incomingSeq++` 还未执行
+**修复**：
+```javascript
+// 错误
+await this.handlePacket(payload, decrypted);
+this.incomingSeq++;
+
+// 正确
+this.incomingSeq++;
+await this.handlePacket(payload, decrypted);
+```
+
+### Bug 3: Ed25519 签名验证失败
+**问题**：服务器返回 USERAUTH_FAILURE
+**原因**：Session ID 被序列化为 `"203,5,138,53,..."` 而不是原始字节
+**修复**：
+```javascript
+// 错误
+sessionData.appendString(this.sessionId);
+
+// 正确
+sessionData.appendBuffer(this.sessionId);
+```
+
+---
+
+## 最终实现功能
+
+1. ✅ 完整 SSH 协议实现
+2. ✅ 密码认证
+3. ✅ 公钥认证（RSA、ECDSA、Ed25519）
+4. ✅ AES-256-CTR 加密
+5. ✅ HMAC-SHA256 完整性校验
+6. ✅ 交互式终端（xterm.js）
+7. ✅ 中文界面
+8. ✅ 完整文档（中英文）
