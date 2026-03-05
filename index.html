@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>WebSSH</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css">
+    <style>
+        body {
+            background: #1e1e1e;
+            margin: 0;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            font-family: Arial, sans-serif;
+        }
+        #connection-panel {
+            background: #2d2d2d;
+            padding: 15px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            border-bottom: 1px solid #3d3d3d;
+            flex-wrap: wrap;
+        }
+        #connection-panel input {
+            padding: 8px;
+            border: 1px solid #3d3d3d;
+            border-radius: 4px;
+            background: #1e1e1e;
+            color: #fff;
+            font-size: 14px;
+        }
+        #connection-panel input:focus {
+            outline: none;
+            border-color: #007acc;
+        }
+        #host { width: 150px; }
+        #port { width: 80px; }
+        #username { width: 120px; }
+        #password { width: 150px; }
+        .btn {
+            padding: 8px 20px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: background 0.2s;
+        }
+        .btn-connect {
+            background: #0e639c;
+            color: #fff;
+        }
+        .btn-connect:hover { background: #1177bb; }
+        .btn-disconnect {
+            background: #c53030;
+            color: #fff;
+        }
+        .btn-disconnect:hover { background: #e53e3e; }
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        #status {
+            margin-left: auto;
+            color: #888;
+            font-size: 14px;
+        }
+        #status.connected { color: #48bb78; }
+        #status.error { color: #f56565; }
+        #terminal { flex: 1; padding: 10px; }
+        .xterm { padding: 5px; }
+    </style>
+</head>
+<body>
+    <div id="connection-panel">
+        <label>Host:</label>
+        <input type="text" id="host" value="127.0.0.1" placeholder="IP Address">
+        <label>Port:</label>
+        <input type="text" id="port" value="22" placeholder="Port">
+        <label>User:</label>
+        <input type="text" id="username" value="root" placeholder="Username">
+        <label>Pass:</label>
+        <input type="password" id="password" value="" placeholder="Password">
+        <button class="btn btn-connect" id="connectBtn" onclick="connect()">Connect</button>
+        <button class="btn btn-disconnect" id="disconnectBtn" onclick="disconnect()" disabled>Disconnect</button>
+        <span id="status">Disconnected</span>
+    </div>
+    <div id="terminal"></div>
+    <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
+    <script src="ssh.js"></script>
+    <script>
+        let ssh = null;
+        let term = null;
+        let fitAddon = null;
+
+        term = new Terminal({
+            cursorBlink: true,
+            fontSize: 14,
+            fontFamily: 'Menlo, Monaco, "Courier New", monospace',
+            theme: {
+                background: '#1e1e1e',
+                foreground: '#d4d4d4'
+            }
+        });
+        fitAddon = new FitAddon.FitAddon();
+        term.loadAddon(fitAddon);
+        term.open(document.getElementById('terminal'));
+        fitAddon.fit();
+
+        term.onData((data) => {
+            if (ssh) {
+                ssh.sendData(data);
+            }
+        });
+
+        function updateStatus(msg, type) {
+            const status = document.getElementById('status');
+            status.textContent = msg;
+            status.className = type || '';
+        }
+
+        
+        function setButtons(connected) {
+            document.getElementById('connectBtn').disabled = connected;
+            document.getElementById('disconnectBtn').disabled = !connected;
+            document.getElementById('host').disabled = connected;
+            document.getElementById('port').disabled = connected;
+            document.getElementById('username').disabled = connected;
+            document.getElementById('password').disabled = connected;
+        }
+
+        
+        async function connect() {
+            const host = document.getElementById('host').value.trim();
+            const port = document.getElementById('port').value.trim();
+            const username = document.getElementById('username').value.trim();
+            const password = document.getElementById('password').value;
+
+            if (!host || !port || !username || !password) {
+                updateStatus('Please fill all fields', 'error');
+                return;
+            }
+
+            if (ssh) {
+                ssh.close();
+            }
+
+            term.clear();
+            updateStatus('Connecting...', '');
+            
+            try {
+                const wsUrl = `wss://claw.603030.xyz:8443/websockify?host=${encodeURIComponent(host)}&port=${encodeURIComponent(port)}`;
+                const ws = new WebSocket(wsUrl);
+                
+                ssh = new SSHConnection(ws);
+                
+                ssh.onData = (data) => {
+                    term.write(data);
+                };
+                
+                ssh.onClose = () => {
+                    updateStatus('Disconnected', '');
+                    setButtons(false);
+                    term.write('\r\n\x1b[31mDisconnected\x1b[0m\r\n');
+                };
+
+                ssh.onDebug = (msg) => {
+                    console.log('[SSH Debug]', msg);
+                };
+
+                await ssh.connect();
+                updateStatus('Authenticating...', '');
+                
+                await ssh.authenticate(username, password);
+                updateStatus('Connected', 'connected');
+                setButtons(true);
+                
+                term.write('\r\n\x1b[32mSSH session established\x1b[0m\r\n');
+                
+                const rows = term.rows;
+                const cols = term.cols;
+                await ssh.openShell(rows, cols);
+                
+                setTimeout(() => term.focus(), 100);
+                
+            } catch (error) {
+                console.error('Connection error:', error);
+                updateStatus('Connection failed', 'error');
+                term.write('\r\n\x1b[31mError: ' + error.message + '\x1b[0m\r\n');
+                setButtons(false);
+            }
+        }
+        
+        function disconnect() {
+            if (ssh) {
+                ssh.close();
+                ssh = null;
+            }
+        }
+        
+        window.onresize = () => {
+            fitAddon.fit();
+            if (ssh && term) {
+                ssh.resize(term.rows, term.cols);
+            }
+        };
+    </script>
+</body>
+</html>
