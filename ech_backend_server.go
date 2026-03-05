@@ -1,7 +1,9 @@
 package main
 
 import (
+	"crypto/ecdh"
 	"crypto/tls"
+	"encoding/base64"
 	"io"
 	"log"
 	"net"
@@ -13,6 +15,23 @@ import (
 )
 
 func main() {
+	echConfigListBase64 := "AET+DQBAeAAgACDDWQgMYMwlIn7bWD/TYjQPIeoGMZFXEDyRjfpvXVBQTgAEAAEAAQARamlyYS50Mm1vYmlsZS5jb20AAA=="
+	echPrivateKeyBase64 := "+HhzlXJgNEVjUF0onSRofCEqM7HlbK8aG3x1kof39k8="
+	echConfigList, err := base64.StdEncoding.DecodeString(echConfigListBase64)
+	if err != nil {
+		log.Fatal("decode ech config:", err)
+	}
+
+	echPrivateKey, err := base64.StdEncoding.DecodeString(echPrivateKeyBase64)
+	if err != nil {
+		log.Fatal("decode ech private key:", err)
+	}
+
+	privateKey, err := ecdh.X25519().NewPrivateKey(echPrivateKey)
+	if err != nil {
+		log.Fatal("parse ech private key:", err)
+	}
+
 	cert, err := tls.LoadX509KeyPair(
 		"/home/level/.acme.sh/claw.603030.xyz_ecc/fullchain.cer",
 		"/home/level/.acme.sh/claw.603030.xyz_ecc/claw.603030.xyz.key",
@@ -21,8 +40,17 @@ func main() {
 		log.Fatal("load cert:", err)
 	}
 
+	echConfig := echConfigList[2:]
+
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{cert},
+		EncryptedClientHelloKeys: []tls.EncryptedClientHelloKey{
+			{
+				Config:      echConfig,
+				PrivateKey:  privateKey.Bytes(),
+				SendAsRetry: true,
+			},
+		},
 		NextProtos:   []string{"h2", "http/1.1"},
 	}
 
