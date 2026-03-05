@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>WebTelnet</title>
+    <link rel="stylesheet" href="xterm.css">
+    <style>
+        body {
+            background: #1e1e1e;
+            margin: 0;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            font-family: Arial, sans-serif;
+        }
+        #connection-panel {
+            background: #2d2d2d;
+            padding: 15px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            border-bottom: 1px solid #3d3d3d;
+        }
+        #connection-panel input {
+            padding: 8px;
+            border: 1px solid #3d3d3d;
+            border-radius: 4px;
+            background: #1e1e1e;
+            color: #fff;
+            font-size: 14px;
+        }
+        #connection-panel input:focus {
+            outline: none;
+            border-color: #007acc;
+        }
+        #host { width: 150px; }
+        #port { width: 80px; }
+        .btn {
+            padding: 8px 20px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: background 0.2s;
+        }
+        .btn-connect {
+            background: #0e639c;
+            color: #fff;
+        }
+        .btn-connect:hover { background: #1177bb; }
+        .btn-disconnect {
+            background: #c53030;
+            color: #fff;
+        }
+        .btn-disconnect:hover { background: #e53e3e; }
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        #status {
+            margin-left: auto;
+            color: #888;
+            font-size: 14px;
+        }
+        #status.connected { color: #48bb78; }
+        #status.error { color: #f56565; }
+        #terminal { flex: 1; padding: 10px; }
+        .xterm { padding: 5px; }
+    </style>
+</head>
+<body>
+    <div id="connection-panel">
+        <label>Host:</label>
+        <input type="text" id="host" value="127.0.0.1" placeholder="IP Address">
+        <label>Port:</label>
+        <input type="text" id="port" value="23" placeholder="Port">
+        <button class="btn btn-connect" id="connectBtn" onclick="connect()">Connect</button>
+        <button class="btn btn-disconnect" id="disconnectBtn" onclick="disconnect()" disabled>Disconnect</button>
+        <span id="status">Disconnected</span>
+    </div>
+    <div id="terminal"></div>
+    <script src="xterm.min.js"></script>
+    <script src="xterm-addon-fit.min.js"></script>
+    <script>
+        let ws = null;
+        let term = null;
+        let fitAddon = null;
+        const wsProxyUrl = 'wss://claw.603030.xyz/websockify';
+
+        term = new Terminal({
+            cursorBlink: true,
+            fontSize: 14,
+            fontFamily: 'Menlo, Monaco, "Courier New", monospace',
+            theme: {
+                background: '#1e1e1e',
+                foreground: '#d4d4d4'
+            }
+        });
+        fitAddon = new FitAddon.FitAddon();
+        term.loadAddon(fitAddon);
+        term.open(document.getElementById('terminal'));
+        fitAddon.fit();
+
+        term.onData((data) => {
+	    if (ws && ws.readyState === WebSocket.OPEN) {
+		console.log("onData " + data.length);
+		let utf8len = 0;
+		for (let i = 0; i < data.length; i++) {
+		    let ch = data.charCodeAt(i);
+		    utf8len++;
+		    if (ch > 0x7f) utf8len++;
+		    if (ch > 0x7ff) utf8len++;
+		    // bytes[i] = data.charCodeAt(i) & 0xFF;
+		    console.log("onData unicode code " + data.charCodeAt(i));
+		}
+
+		let j = 0;
+		const bytes = new Uint8Array(utf8len);
+		for (let i = 0; i < data.length; i++) {
+		    let ch = data.charCodeAt(i);
+		    if (ch <= 0x7F) {
+			bytes[j++] = ch & 0xff;
+		    } else if (ch <= 0x7ff) {
+			bytes[j++] = 0xc0 | (ch >> 6);
+			bytes[j++] = 0x80 | (ch & 0x3f);
+		    } else {
+			bytes[j++] = 0xe0 | (ch >> 12);
+			bytes[j++] = 0x80 | ((ch >> 6) & 0x3f);
+			bytes[j++] = 0x80 | (ch & 0x3f);
+		    }
+		}
+		ws.send(bytes);
+	    }
+        });
+
+        function filterTelnet(data) {
+            const result = [];
+            let i = 0;
+            while (i < data.length) {
+                if (data[i] === 255 && i + 1 < data.length) {
+                    const cmd = data[i + 1];
+                    if (cmd === 255) {
+                        result.push(255);
+                        i += 2;
+                    } else if (cmd >= 251 && cmd <= 254) {
+                        i += 3;
+                    } else if (cmd === 250) {
+                        let j = i + 2;
+                        while (j < data.length && data[j] !== 255) j++;
+                        if (j + 1 < data.length) {
+                            i = j + 2;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        if (i + 2 < data.length) {
+                            i += 3;
+                        } else {
+                            break;
+                        }
+                    }
+                } else {
+                    result.push(data[i]);
+                    i++;
+                }
+            }
+            return new Uint8Array(result);
+        }
+
+        function updateStatus(msg, type) {
+            const status = document.getElementById('status');
+            status.textContent = msg;
+            status.className = type || '';
+        }
+
+        function setButtons(connected) {
+            document.getElementById('connectBtn').disabled = connected;
+            document.getElementById('disconnectBtn').disabled = !connected;
+            document.getElementById('host').disabled = connected;
+            document.getElementById('port').disabled = connected;
+        }
+
+        function connect() {
+            const host = document.getElementById('host').value.trim();
+            const port = document.getElementById('port').value.trim();
+
+            if (!host || !port) {
+                updateStatus('Please enter host and port', 'error');
+                return;
+            }
+
+            if (ws) ws.close();
+
+            const url = `${wsProxyUrl}?host=${encodeURIComponent(host)}&port=${encodeURIComponent(port)}`;
+            ws = new WebSocket(url);
+            ws.binaryType = 'arraybuffer';
+
+            ws.onopen = () => {
+                updateStatus('Connected', 'connected');
+                setButtons(true);
+                term.write('\r\n\x1b[32mConnected to ' + host + ':' + port + '\x1b[0m\r\n');
+                setTimeout(() => term.focus(), 100);
+            };
+
+            ws.onmessage = (e) => {
+                if (typeof e.data === 'string') {
+                    term.write(e.data);
+                } else {
+                    const data = new Uint8Array(e.data);
+                    const filtered = filterTelnet(data);
+                    if (filtered.length > 0) {
+                        term.write(filtered);
+                    }
+                }
+            };
+
+            ws.onclose = () => {
+                updateStatus('Disconnected', '');
+                setButtons(false);
+                term.write('\r\n\x1b[31mDisconnected\x1b[0m\r\n');
+            };
+
+            ws.onerror = (e) => {
+                updateStatus('Connection error', 'error');
+                term.write('\r\n\x1b[31mError connecting to ' + host + ':' + port + '\x1b[0m\r\n');
+            };
+        }
+
+        function disconnect() {
+            if (ws) ws.close();
+        }
+
+        window.onresize = () => fitAddon.fit();
+    </script>
+</body>
+</html>
