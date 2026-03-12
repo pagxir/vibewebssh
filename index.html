@@ -315,9 +315,7 @@
                         sender: (octets) => {
                             return ssh.sendData(new Uint8Array(octets));
                         },
-                        on_retract: () => {
-                            console.log('[ZMODEM] retract');
-                        },
+                        on_retract: () => {},
                         on_detect: (detection) => {
                             const zsession = detection.confirm();
                             zmodemActive = true;
@@ -341,8 +339,8 @@
                                 });
 
                                 zsession.on('session_end', () => {
-                                    zmodemActive = false;
                                     term.write('\x1b[33m[ZMODEM] 传输结束\x1b[0m\r\n');
+                                    zmodemActive = false;
                                     zsentry = null;
                                     setupZsentry();
                                 });
@@ -456,9 +454,7 @@
                     term.write('\r\n\x1b[31m连接已断开\x1b[0m\r\n');
                 };
 
-                ssh.onDebug = (msg) => {
-                    console.log('[SSH Debug]', msg);
-                };
+                ssh.onDebug = () => {};
 
                 await ssh.connect();
                 updateStatus('认证中...', '');

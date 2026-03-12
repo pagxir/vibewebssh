@@ -350,7 +350,6 @@ class SSHConnection {
 
     debug(msg) {
         if (this.onDebug) this.onDebug(msg);
-        console.log('[SSH]', msg);
     }
 
     async connect() {
@@ -365,7 +364,6 @@ class SSHConnection {
         this.ws.onmessage = (event) => {
             const data = new Uint8Array(event.data);
             this.debug(`WS received ${data.length} bytes, state: ${this.state}`);
-            console.log('WS.onmessage:', data.length, 'bytes');
             this._recvQueue.push(data);
             this._drainRecvQueue();
         };
@@ -587,7 +585,6 @@ class SSHConnection {
         const payload = packet.slice(5, 5 + payloadLength);
         
         this.incomingSeq++;
-        console.log('About to call handlePacket with', payload.length, 'bytes (payload only)');
         await this.handlePacket(payload, packet);
         return true;
     }
@@ -1242,10 +1239,7 @@ class SSHConnection {
         }
         
         const keyTypeBytes = readOpenSSHString();
-        console.log('Key type bytes:', Array.from(keyTypeBytes).map(b => b.toString(16).padStart(2, '0')).join(' '));
         const keyType = new TextDecoder().decode(keyTypeBytes);
-        console.log('Key type:', keyType, 'length:', keyType.length);
-        console.log('Current offset after keyType:', offset);
         
         if (keyType === 'ssh-rsa') {
             const n = readOpenSSHString();
@@ -1266,9 +1260,6 @@ class SSHConnection {
             const pubKey = readOpenSSHString();
             const privKey = readOpenSSHString();
             const comment = readOpenSSHString();
-            
-            console.log('Ed25519 pubKey length:', pubKey.length);
-            console.log('Ed25519 privKey length:', privKey.length);
             
             return {
                 keyType: 'ssh-ed25519',
