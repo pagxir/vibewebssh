@@ -262,15 +262,10 @@ class AESCounter {
         this.key = key;
         this.counter = new Uint8Array(16);
         this.counter.set(iv.slice(0, 16));
-        this.cipher = null;
     }
 
     async init() {
-        this.cipher = await crypto.subtle.importKey(
-            'raw', this.key,
-            { name: 'AES-CTR' },
-            false, ['encrypt', 'decrypt']
-        );
+        // No-op: we create cipher on-demand
     }
 
     saveState() {
@@ -284,9 +279,16 @@ class AESCounter {
     async process(data) {
         const counterCopy = new Uint8Array(this.counter);
         
+        // Create fresh cipher for each operation to avoid state corruption
+        const cipher = await crypto.subtle.importKey(
+            'raw', this.key,
+            { name: 'AES-CTR' },
+            false, ['encrypt', 'decrypt']
+        );
+        
         const result = await crypto.subtle.encrypt(
             { name: 'AES-CTR', counter: counterCopy, length: 128 },
-            this.cipher,
+            cipher,
             data
         );
         
@@ -357,11 +359,15 @@ class SSHConnection {
         
         this.debug(`WebSocket initial state: ${this.ws.readyState} (CONNECTING=0, OPEN=1, CLOSING=2, CLOSED=3)`);
         
+        this._recvQueue = [];
+        this._recvProcessing = false;
+
         this.ws.onmessage = (event) => {
             const data = new Uint8Array(event.data);
             this.debug(`WS received ${data.length} bytes, state: ${this.state}`);
             console.log('WS.onmessage:', data.length, 'bytes');
-            this.handleData(data);
+            this._recvQueue.push(data);
+            this._drainRecvQueue();
         };
         
         this.ws.onclose = (event) => {
@@ -489,6 +495,29 @@ class SSHConnection {
         this.debug('KEXINIT sent');
     }
 
+    _drainRecvQueue() {
+        if (this._recvProcessing) {
+            this.debug(`Queue busy, ${this._recvQueue.length} items waiting`);
+            return;
+        }
+        this._recvProcessing = true;
+        
+        const processNext = async () => {
+            try {
+                while (this._recvQueue.length > 0) {
+                    const data = this._recvQueue.shift();
+                    this.debug(`Processing queued message: ${data.length} bytes, ${this._recvQueue.length} remaining`);
+                    await this.handleData(data);
+                }
+            } finally {
+                this._recvProcessing = false;
+                this.debug('Queue processing complete');
+            }
+        };
+        
+        processNext();
+    }
+
     async handleData(data) {
         try {
             if (this.state === 'banner') {
@@ -581,9 +610,10 @@ class SSHConnection {
         
         this.debug(`decryptNextPacket: len=${len}, buffer=${this.readBuffer.length}`);
         
-        if (len > 256000 || len < 0) {
-            this.debug('Invalid decrypted length');
+        if (len > 1000000 || len < 0) {
+            this.debug('Invalid decrypted length - cipher desync, closing connection');
             this.incomingCipher.restoreState(savedState);
+            if (this.onClose) this.onClose();
             return false;
         }
         
@@ -672,7 +702,7 @@ class SSHConnection {
                 this.handleAuthFailure(pkt);
                 break;
             case SSH_MSG_USERAUTH_PK_OK:
-                await this.handlePkOk(pkt);
+                this.handlePkOk(pkt);
                 break;
             case SSH_MSG_USERAUTH_BANNER:
                 this.handleAuthBanner(pkt);
@@ -840,13 +870,13 @@ class SSHConnection {
         this.debug(`Enc C->S: ${Array.from(encKeyClientToServer.slice(0, 8)).map(b => b.toString(16).padStart(2, '0')).join('')}`);
         this.debug(`Enc S->C: ${Array.from(encKeyServerToClient.slice(0, 8)).map(b => b.toString(16).padStart(2, '0')).join('')}`);
         
-        this.incomingCipher = new AESCounter(encKeyServerToClient, ivServerToClient);
-        await this.incomingCipher.init();
+        this.pendingIncomingCipher = new AESCounter(encKeyServerToClient, ivServerToClient);
+        await this.pendingIncomingCipher.init();
         
         this.outgoingCipher = new AESCounter(encKeyClientToServer, ivClientToServer);
         await this.outgoingCipher.init();
         
-        this.incomingMac = { key: macKeyServerToClient };
+        this.pendingIncomingMac = { key: macKeyServerToClient };
         this.outgoingMac = { key: macKeyClientToServer };
         
         this.debug('Keys derived and ciphers initialized');
@@ -854,6 +884,8 @@ class SSHConnection {
 
     handleNewKeys() {
         this.debug('Received NEWKEYS, switching to transport layer');
+        this.incomingCipher = this.pendingIncomingCipher;
+        this.incomingMac = this.pendingIncomingMac;
         this.state = 'transport';
         
         this.debug('Resolving handshake promise');
@@ -979,7 +1011,7 @@ class SSHConnection {
         });
     }
 
-    async handlePkOk(pkt) {
+    handlePkOk(pkt) {
         this.debug('Server accepts public key, signing...');
         
         const keyData = this.pkAuthKeyData;
@@ -1009,50 +1041,30 @@ class SSHConnection {
             this.debug(`Public key: ${Array.from(pubKeyDisplay.slice(0, 32)).map(b => b.toString(16).padStart(2, '0')).join(' ')}`);
         }
 
-        let signature;
-        try {
-            signature = await this.signWithKey(keyData, dataToSign);
+        // Sign asynchronously without blocking the queue
+        this.signWithKey(keyData, dataToSign).then(signature => {
             this.debug(`Signature (${signature.length} bytes): ${Array.from(signature).map(b => b.toString(16).padStart(2, '0')).join(' ')}`);
-        } catch (e) {
+            
+            const sigBlob = new SSHBuffer();
+            sigBlob.appendString(keyData.sigAlg || keyData.keyType);
+            sigBlob.appendBuffer(signature);
+
+            const buf = new SSHBuffer();
+            buf.appendByte(SSH_MSG_USERAUTH_REQUEST);
+            buf.appendString(username);
+            buf.appendString(SSH_SERVICE_CONNECTION);
+            buf.appendString(SSH_AUTH_TYPE_PUBLICKEY);
+            buf.appendByte(1);
+            buf.appendString(algName);
+            buf.appendBuffer(pubKeyBlob);
+            buf.appendBuffer(sigBlob.toUint8Array());
+
+            this.sendPacket(buf.toUint8Array());
+        }).catch(e => {
             this.debug('Signing failed: ' + e.message);
             if (this.pkAuthPromiseReject) {
                 this.pkAuthPromiseReject(new Error('Signing failed: ' + e.message));
             }
-            return;
-        }
-
-        const sigBlob = new SSHBuffer();
-        sigBlob.appendString(keyData.sigAlg || keyData.keyType);
-        sigBlob.appendBuffer(signature);
-
-        const buf = new SSHBuffer();
-        buf.appendByte(SSH_MSG_USERAUTH_REQUEST);
-        buf.appendString(username);
-        buf.appendString(SSH_SERVICE_CONNECTION);
-        buf.appendString(SSH_AUTH_TYPE_PUBLICKEY);
-        buf.appendByte(1);
-        buf.appendString(algName);
-        buf.appendBuffer(pubKeyBlob);
-        buf.appendBuffer(sigBlob.toUint8Array());
-
-        this.sendPacket(buf.toUint8Array());
-
-        await new Promise((resolve, reject) => {
-            const check = setInterval(() => {
-                if (this.authenticated) {
-                    clearInterval(check);
-                    if (this.pkAuthPromiseResolve) {
-                        this.pkAuthPromiseResolve();
-                    }
-                    resolve();
-                } else if (this.authFailed) {
-                    clearInterval(check);
-                    if (this.pkAuthPromiseReject) {
-                        this.pkAuthPromiseReject(new Error('Key authentication failed'));
-                    }
-                    reject(new Error('Key authentication failed'));
-                }
-            }, 50);
         });
     }
 
@@ -1619,12 +1631,22 @@ class SSHConnection {
     handleAuthSuccess() {
         this.debug('Authentication successful!');
         this.authenticated = true;
+        if (this.pkAuthPromiseResolve) {
+            this.pkAuthPromiseResolve();
+            this.pkAuthPromiseResolve = null;
+            this.pkAuthPromiseReject = null;
+        }
     }
 
     handleAuthFailure(pkt) {
         const auths = pkt.readStringText().split(',');
         this.debug(`Authentication failed. Available methods: ${auths}`);
         this.authFailed = true;
+        if (this.pkAuthPromiseReject) {
+            this.pkAuthPromiseReject(new Error('Key authentication failed'));
+            this.pkAuthPromiseResolve = null;
+            this.pkAuthPromiseReject = null;
+        }
     }
 
     handleAuthBanner(pkt) {
@@ -1736,6 +1758,16 @@ class SSHConnection {
         
         if (this.onData && recipientChannel === this.shellChannel) {
             this.onData(data);
+            
+            // Send WINDOW_ADJUST to allow server to send more data
+            const ch = this.channels.get(recipientChannel);
+            if (ch && data.length > 0) {
+                const buf = new SSHBuffer();
+                buf.appendByte(SSH_MSG_CHANNEL_WINDOW_ADJUST);
+                buf.appendInt32(ch.remoteId);
+                buf.appendInt32(data.length);
+                this.sendPacket(buf.toUint8Array());
+            }
         }
     }
 
@@ -1772,6 +1804,16 @@ class SSHConnection {
         
         if (this.onData && recipientChannel === this.shellChannel) {
             this.onData(data);
+            
+            // Send WINDOW_ADJUST
+            const ch = this.channels.get(recipientChannel);
+            if (ch && data.length > 0) {
+                const buf = new SSHBuffer();
+                buf.appendByte(SSH_MSG_CHANNEL_WINDOW_ADJUST);
+                buf.appendInt32(ch.remoteId);
+                buf.appendInt32(data.length);
+                this.sendPacket(buf.toUint8Array());
+            }
         }
     }
 

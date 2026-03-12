@@ -439,7 +439,12 @@
                         return;
                     }
                     try {
-                        zsentry.consume(data.buffer ? Array.from(data) : data);
+                        const arr = data.buffer ? Array.from(data) : data;
+                        // Feed in 8KB chunks to avoid overwhelming ZMODEM library
+                        const chunkSize = 8192;
+                        for (let i = 0; i < arr.length; i += chunkSize) {
+                            zsentry.consume(arr.slice(i, i + chunkSize));
+                        }
                     } catch(e) {
                         console.error('[ZMODEM] consume error:', e);
                     }
