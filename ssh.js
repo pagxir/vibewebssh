@@ -943,13 +943,24 @@ class SSHConnection {
 
         const pubKeyBlob = this.buildPublicKeyBlob(keyData);
         
+        this.debug(`RSA key: n length=${keyData.n ? keyData.n.length : 'undefined'}, e length=${keyData.e ? keyData.e.length : 'undefined'}`);
+        this.debug(`Public key blob length: ${pubKeyBlob.length}`);
+        this.debug(`Public key blob (first 50 bytes): ${Array.from(pubKeyBlob.slice(0, 50)).map(b => b.toString(16).padStart(2, '0')).join(' ')}`);
+        
+        crypto.subtle.digest('SHA-256', pubKeyBlob).then(fp => {
+            const fpBytes = new Uint8Array(fp);
+            const fpHex = Array.from(fpBytes).map(b => b.toString(16).padStart(2, '0')).join('');
+            this.debug(`Public key fingerprint (SHA-256): ${fpHex.substring(0, 2)}:${fpHex.substring(2, 4)}:${fpHex.substring(4, 6)}:${fpHex.substring(6, 8)}:${fpHex.substring(8, 10)}:${fpHex.substring(10, 12)}:${fpHex.substring(12, 14)}:${fpHex.substring(14, 16)}:${fpHex.substring(16, 18)}:${fpHex.substring(18, 20)}:${fpHex.substring(20, 22)}:${fpHex.substring(22, 24)}:${fpHex.substring(24, 26)}:${fpHex.substring(26, 28)}:${fpHex.substring(28, 30)}:${fpHex.substring(30, 32)}`);
+        });
+        
         const buf = new SSHBuffer();
         buf.appendByte(SSH_MSG_USERAUTH_REQUEST);
         buf.appendString(username);
         buf.appendString(SSH_SERVICE_CONNECTION);
         buf.appendString(SSH_AUTH_TYPE_PUBLICKEY);
         buf.appendByte(0);
-        buf.appendString(keyData.keyType);
+        const algName = keyData.keyType === 'ssh-rsa' ? 'rsa-sha2-256' : keyData.keyType;
+        buf.appendString(algName);
         buf.appendBuffer(pubKeyBlob);
         
         this.sendPacket(buf.toUint8Array());
@@ -974,6 +985,8 @@ class SSHConnection {
 
         const pubKeyBlob = this.buildPublicKeyBlob(keyData);
 
+        const algName = keyData.keyType === 'ssh-rsa' ? 'rsa-sha2-256' : keyData.keyType;
+
         const sessionData = new SSHBuffer();
         sessionData.appendBuffer(this.sessionId);
         sessionData.appendByte(SSH_MSG_USERAUTH_REQUEST);
@@ -981,14 +994,18 @@ class SSHConnection {
         sessionData.appendString(SSH_SERVICE_CONNECTION);
         sessionData.appendString(SSH_AUTH_TYPE_PUBLICKEY);
         sessionData.appendByte(1);
-        sessionData.appendString(keyData.keyType);
+        sessionData.appendString(algName);
         sessionData.appendBuffer(pubKeyBlob);
 
         const dataToSign = sessionData.toUint8Array();
 
         this.debug(`Data to sign (${dataToSign.length} bytes): ${Array.from(dataToSign.slice(0, 40)).map(b => b.toString(16).padStart(2, '0')).join(' ')}...`);
-        this.debug(`Session ID: ${Array.from(this.sessionId).map(b => b.toString(16).padStart(2, '0')).join(' ')}`);
-        this.debug(`Public key: ${Array.from(keyData.pubKey).map(b => b.toString(16).padStart(2, '0')).join(' ')}`);
+        this.debug(`Session ID: ${this.sessionId ? Array.from(this.sessionId).map(b => b.toString(16).padStart(2, '0')).join(' ') : 'undefined'}`);
+        
+        const pubKeyDisplay = keyData.pubKey || keyData.Q || keyData.n;
+        if (pubKeyDisplay && pubKeyDisplay.slice) {
+            this.debug(`Public key: ${Array.from(pubKeyDisplay.slice(0, 32)).map(b => b.toString(16).padStart(2, '0')).join(' ')}`);
+        }
 
         let signature;
         try {
@@ -1012,7 +1029,7 @@ class SSHConnection {
         buf.appendString(SSH_SERVICE_CONNECTION);
         buf.appendString(SSH_AUTH_TYPE_PUBLICKEY);
         buf.appendByte(1);
-        buf.appendString(keyData.keyType);
+        buf.appendString(algName);
         buf.appendBuffer(pubKeyBlob);
         buf.appendBuffer(sigBlob.toUint8Array());
 
@@ -1061,37 +1078,60 @@ class SSHConnection {
             const hash = 'SHA-256';
             keyData.sigAlg = 'rsa-sha2-256';
             
-            const cryptoKey = await crypto.subtle.importKey(
-                'pkcs8',
-                keyData.pkcs8,
-                { name: 'RSASSA-PKCS1-v1_5', hash: hash },
-                false,
-                ['sign']
-            );
-            
-            const sig = await crypto.subtle.sign(
-                'RSASSA-PKCS1-v1_5',
-                cryptoKey,
-                data
-            );
-            
-            return new Uint8Array(sig);
+            try {
+                this.debug(`RSA signing: pkcs8 length=${keyData.pkcs8.length}`);
+                this.debug(`PKCS8 header (first 32 bytes): ${Array.from(keyData.pkcs8.slice(0, 32)).map(b => b.toString(16).padStart(2, '0')).join(' ')}`);
+                const cryptoKey = await window.crypto.subtle.importKey(
+                    'pkcs8',
+                    keyData.pkcs8,
+                    { name: 'RSASSA-PKCS1-v1_5', hash: hash },
+                    false,
+                    ['sign']
+                );
+                
+                const sig = await window.crypto.subtle.sign(
+                    'RSASSA-PKCS1-v1_5',
+                    cryptoKey,
+                    data
+                );
+                
+                return new Uint8Array(sig);
+            } catch (e) {
+                this.debug('RSA signing error: ' + e.message + ', stack: ' + e.stack);
+                throw e;
+            }
         } else if (keyData.keyType.startsWith('ecdsa-sha2-')) {
-            const cryptoKey = await crypto.subtle.importKey(
-                'pkcs8',
-                keyData.pkcs8,
-                { name: 'ECDSA', namedCurve: keyData.namedCurve },
-                false,
-                ['sign']
-            );
-            
-            const sigRaw = await crypto.subtle.sign(
-                { name: 'ECDSA', hash: 'SHA-256' },
-                cryptoKey,
-                data
-            );
-            
-            return this.ecdsaSigToSSH(new Uint8Array(sigRaw));
+            try {
+                this.debug('ECDSA signing: keyType=' + keyData.keyType + ', namedCurve=' + keyData.namedCurve + ', pkcs8 length=' + keyData.pkcs8.length);
+                
+                const cryptoKey = await window.crypto.subtle.importKey(
+                    'pkcs8',
+                    keyData.pkcs8,
+                    { name: 'ECDSA', namedCurve: keyData.namedCurve },
+                    false,
+                    ['sign']
+                );
+                this.debug('ECDSA key imported successfully');
+                
+                let hashAlg = 'SHA-256';
+                if (keyData.keyType === 'ecdsa-sha2-nistp384') {
+                    hashAlg = 'SHA-384';
+                } else if (keyData.keyType === 'ecdsa-sha2-nistp521') {
+                    hashAlg = 'SHA-512';
+                }
+                
+                const sigRaw = await window.crypto.subtle.sign(
+                    { name: 'ECDSA', hash: hashAlg },
+                    cryptoKey,
+                    data
+                );
+                this.debug('ECDSA signature raw: ' + Array.from(new Uint8Array(sigRaw).slice(0, 20)).map(b => b.toString(16).padStart(2, '0')).join(' '));
+                
+                return this.ecdsaSigToSSH(new Uint8Array(sigRaw));
+            } catch (e) {
+                this.debug('ECDSA signing error: ' + e.message + ', stack: ' + e.stack);
+                throw e;
+            }
         } else if (keyData.keyType === 'ssh-ed25519') {
             keyData.sigAlg = 'ssh-ed25519';
             
@@ -1228,11 +1268,11 @@ class SSHConnection {
     }
 
     buildRSAKeyFromParts(n, e, d, p, q) {
-        const nInt = this.bytesToBigInt(n);
-        const eInt = this.bytesToBigInt(e);
-        const dInt = this.bytesToBigInt(d);
-        const pInt = this.bytesToBigInt(p);
-        const qInt = this.bytesToBigInt(q);
+        const nInt = bytesToBigInt(n);
+        const eInt = bytesToBigInt(e);
+        const dInt = bytesToBigInt(d);
+        const pInt = bytesToBigInt(p);
+        const qInt = bytesToBigInt(q);
         
         const dp = dInt % (pInt - 1n);
         const dq = dInt % (qInt - 1n);
@@ -1314,10 +1354,18 @@ class SSHConnection {
 
     buildECKeyFromParts(keyType, curve, Q, d) {
         let namedCurve;
-        if (curve === 'nistp256') namedCurve = 'P-256';
-        else if (curve === 'nistp384') namedCurve = 'P-384';
-        else if (curve === 'nistp521') namedCurve = 'P-521';
+        let keySize;
+        if (curve === 'nistp256') { namedCurve = 'P-256'; keySize = 32; }
+        else if (curve === 'nistp384') { namedCurve = 'P-384'; keySize = 48; }
+        else if (curve === 'nistp521') { namedCurve = 'P-521'; keySize = 66; }
         else throw new Error('Unsupported curve: ' + curve);
+        
+        let dPadded = new Uint8Array(d);
+        if (dPadded.length < keySize) {
+            const newD = new Uint8Array(keySize);
+            newD.set(dPadded, keySize - dPadded.length);
+            dPadded = newD;
+        }
         
         const pkcs8 = this.buildPKCS8EC(keyType, curve, Q, d);
         
@@ -1326,64 +1374,56 @@ class SSHConnection {
             curve: curve,
             namedCurve: namedCurve,
             Q: Q,
-            d: d,
+            d: dPadded,
             pkcs8: pkcs8
         };
     }
 
     buildPKCS8EC(keyType, curve, Q, d) {
-        const version = new Uint8Array([0x02, 0x01, 0x00]);
-        
         const curveOid = curve === 'nistp256' ? new Uint8Array([0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07]) :
                          curve === 'nistp384' ? new Uint8Array([0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x22]) :
                          new Uint8Array([0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x23]);
         
-        const algIdLen = 2 + curveOid.length + 2;
-        const algId = new Uint8Array(algIdLen);
-        algId[0] = 0x30;
-        algId[1] = algIdLen - 2;
-        algId[2] = 0x06;
-        algId[3] = curveOid.length - 2;
-        algId.set(curveOid.slice(2), 4);
-        
         const ecOid = new Uint8Array([0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01]);
-        const fullAlgId = this.concatUint8(
-            new Uint8Array([0x30, ecOid.length + curveOid.length + 4]),
-            this.concatUint8(ecOid, curveOid)
-        );
         
-        const ecPriv = new Uint8Array(7 + d.length + 4 + Q.length);
-        let off = 0;
-        ecPriv[off++] = 0x30;
-        const innerLen = 3 + d.length + 4 + Q.length;
-        ecPriv[off++] = (innerLen >> 8) & 0xff;
-        ecPriv[off++] = innerLen & 0xff;
-        ecPriv[off++] = 0x02;
-        ecPriv[off++] = 0x01;
-        ecPriv[off++] = 0x01;
-        ecPriv[off++] = 0x04;
-        ecPriv[off++] = d.length;
-        ecPriv.set(d, off);
-        off += d.length;
-        ecPriv[off++] = 0xa1;
-        ecPriv[off++] = 0x03;
-        ecPriv[off++] = 0x02;
-        ecPriv[off++] = 0x01;
-        ecPriv[off++] = 0x00;
-        ecPriv.set(Q, off);
+        const algIdContent = this.concatUint8(ecOid, curveOid);
+        const algId = new Uint8Array(2 + algIdContent.length);
+        algId[0] = 0x30;
+        algId[1] = algIdContent.length;
+        algId.set(algIdContent, 2);
         
-        const total = version.length + fullAlgId.length + 4 + ecPriv.length;
-        const result = new Uint8Array(4 + total);
+        const privKeyOctet = new Uint8Array(1 + d.length);
+        privKeyOctet[0] = d.length;
+        privKeyOctet.set(d, 1);
+        
+        const privKeyContent = new Uint8Array(2 + privKeyOctet.length);
+        privKeyContent[0] = 0x02;
+        privKeyContent[1] = privKeyOctet.length;
+        privKeyContent.set(privKeyOctet, 2);
+        
+        const pubKeyBitString = new Uint8Array(2 + Q.length);
+        pubKeyBitString[0] = 0x00;
+        pubKeyBitString[1] = Q.length;
+        pubKeyBitString.set(Q, 2);
+        
+        const pubKeyWrapper = new Uint8Array(2 + pubKeyBitString.length);
+        pubKeyWrapper[0] = 0xa1;
+        pubKeyWrapper[1] = pubKeyBitString.length;
+        pubKeyWrapper.set(pubKeyBitString, 2);
+        
+        const ecPrivateKeyContent = this.concatUint8(privKeyContent, pubKeyWrapper);
+        const ecPrivateKeyOctet = new Uint8Array(2 + ecPrivateKeyContent.length);
+        ecPrivateKeyOctet[0] = 0x04;
+        ecPrivateKeyOctet[1] = ecPrivateKeyContent.length;
+        ecPrivateKeyOctet.set(ecPrivateKeyContent, 2);
+        
+        const version = new Uint8Array([0x02, 0x01, 0x00]);
+        
+        const pkcs8Content = this.concatUint8(version, this.concatUint8(algId, ecPrivateKeyOctet));
+        const result = new Uint8Array(2 + pkcs8Content.length);
         result[0] = 0x30;
-        result[1] = 0x82;
-        result[2] = (total >> 8) & 0xff;
-        result[3] = total & 0xff;
-        result.set(version, 4);
-        result.set(fullAlgId, 4 + version.length);
-        
-        const octetHeader = new Uint8Array([0x04, 0x82, (ecPriv.length >> 8) & 0xff, ecPriv.length & 0xff]);
-        result.set(octetHeader, 4 + version.length + fullAlgId.length);
-        result.set(ecPriv, 4 + version.length + fullAlgId.length + octetHeader.length);
+        result[1] = pkcs8Content.length;
+        result.set(pkcs8Content, 2);
         
         return result;
     }
@@ -1485,13 +1525,20 @@ class SSHConnection {
             total += item.length;
         }
         
-        const result = new Uint8Array(4 + total);
-        result[0] = 0x30;
-        result[1] = 0x82;
-        result[2] = (total >> 8) & 0xff;
-        result[3] = total & 0xff;
+        let lenBytes;
+        if (total < 128) {
+            lenBytes = new Uint8Array([total]);
+        } else if (total < 256) {
+            lenBytes = new Uint8Array([0x81, total]);
+        } else {
+            lenBytes = new Uint8Array([0x82, (total >> 8) & 0xff, total & 0xff]);
+        }
         
-        let offset = 4;
+        const result = new Uint8Array(1 + lenBytes.length + total);
+        result[0] = 0x30;
+        result.set(lenBytes, 1);
+        
+        let offset = 1 + lenBytes.length;
         for (const item of items) {
             result.set(item, offset);
             offset += item.length;
