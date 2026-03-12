@@ -1387,44 +1387,74 @@ class SSHConnection {
         const ecOid = new Uint8Array([0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01]);
         
         const algIdContent = this.concatUint8(ecOid, curveOid);
-        const algId = new Uint8Array(2 + algIdContent.length);
-        algId[0] = 0x30;
-        algId[1] = algIdContent.length;
-        algId.set(algIdContent, 2);
+        const algId = this.buildDERSequence([algIdContent]).slice(1);
+        const algIdFull = new Uint8Array(1 + algId.length);
+        algIdFull[0] = 0x30;
+        algIdFull.set(algId, 1);
         
-        const privKeyOctet = new Uint8Array(1 + d.length);
-        privKeyOctet[0] = d.length;
-        privKeyOctet.set(d, 1);
-        
-        const privKeyContent = new Uint8Array(2 + privKeyOctet.length);
-        privKeyContent[0] = 0x02;
-        privKeyContent[1] = privKeyOctet.length;
-        privKeyContent.set(privKeyOctet, 2);
-        
-        const pubKeyBitString = new Uint8Array(2 + Q.length);
-        pubKeyBitString[0] = 0x00;
-        pubKeyBitString[1] = Q.length;
-        pubKeyBitString.set(Q, 2);
-        
-        const pubKeyWrapper = new Uint8Array(2 + pubKeyBitString.length);
-        pubKeyWrapper[0] = 0xa1;
-        pubKeyWrapper[1] = pubKeyBitString.length;
-        pubKeyWrapper.set(pubKeyBitString, 2);
-        
-        const ecPrivateKeyContent = this.concatUint8(privKeyContent, pubKeyWrapper);
-        const ecPrivateKeyOctet = new Uint8Array(2 + ecPrivateKeyContent.length);
-        ecPrivateKeyOctet[0] = 0x04;
-        ecPrivateKeyOctet[1] = ecPrivateKeyContent.length;
-        ecPrivateKeyOctet.set(ecPrivateKeyContent, 2);
+        const ecPrivKeySeq = this.buildDERSequence([
+            new Uint8Array([0x02, 0x01, 0x01]),
+            this.buildDEROctetString(d),
+            this.buildDERContextSpecific(1, this.buildDERBitString(Q))
+        ]);
         
         const version = new Uint8Array([0x02, 0x01, 0x00]);
         
-        const pkcs8Content = this.concatUint8(version, this.concatUint8(algId, ecPrivateKeyOctet));
-        const result = new Uint8Array(2 + pkcs8Content.length);
-        result[0] = 0x30;
-        result[1] = pkcs8Content.length;
-        result.set(pkcs8Content, 2);
-        
+        return this.buildDERSequence([
+            version,
+            algIdFull,
+            this.buildDEROctetString(ecPrivKeySeq)
+        ]);
+    }
+    
+    buildDEROctetString(data) {
+        let lenBytes;
+        if (data.length < 128) {
+            lenBytes = new Uint8Array([data.length]);
+        } else if (data.length < 256) {
+            lenBytes = new Uint8Array([0x81, data.length]);
+        } else {
+            lenBytes = new Uint8Array([0x82, (data.length >> 8) & 0xff, data.length & 0xff]);
+        }
+        const result = new Uint8Array(1 + lenBytes.length + data.length);
+        result[0] = 0x04;
+        result.set(lenBytes, 1);
+        result.set(data, 1 + lenBytes.length);
+        return result;
+    }
+    
+    buildDERBitString(data) {
+        const content = new Uint8Array(1 + data.length);
+        content[0] = 0x00;
+        content.set(data, 1);
+        let lenBytes;
+        if (content.length < 128) {
+            lenBytes = new Uint8Array([content.length]);
+        } else if (content.length < 256) {
+            lenBytes = new Uint8Array([0x81, content.length]);
+        } else {
+            lenBytes = new Uint8Array([0x82, (content.length >> 8) & 0xff, content.length & 0xff]);
+        }
+        const result = new Uint8Array(1 + lenBytes.length + content.length);
+        result[0] = 0x03;
+        result.set(lenBytes, 1);
+        result.set(content, 1 + lenBytes.length);
+        return result;
+    }
+    
+    buildDERContextSpecific(tag, data) {
+        let lenBytes;
+        if (data.length < 128) {
+            lenBytes = new Uint8Array([data.length]);
+        } else if (data.length < 256) {
+            lenBytes = new Uint8Array([0x81, data.length]);
+        } else {
+            lenBytes = new Uint8Array([0x82, (data.length >> 8) & 0xff, data.length & 0xff]);
+        }
+        const result = new Uint8Array(1 + lenBytes.length + data.length);
+        result[0] = 0xa0 | tag;
+        result.set(lenBytes, 1);
+        result.set(data, 1 + lenBytes.length);
         return result;
     }
 
@@ -1512,10 +1542,19 @@ class SSHConnection {
             val = this.concatUint8(new Uint8Array([0]), val);
         }
         
-        const result = new Uint8Array(2 + val.length);
+        let lenBytes;
+        if (val.length < 128) {
+            lenBytes = new Uint8Array([val.length]);
+        } else if (val.length < 256) {
+            lenBytes = new Uint8Array([0x81, val.length]);
+        } else {
+            lenBytes = new Uint8Array([0x82, (val.length >> 8) & 0xff, val.length & 0xff]);
+        }
+        
+        const result = new Uint8Array(1 + lenBytes.length + val.length);
         result[0] = 0x02;
-        result[1] = val.length;
-        result.set(val, 2);
+        result.set(lenBytes, 1);
+        result.set(val, 1 + lenBytes.length);
         return result;
     }
 
