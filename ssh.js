@@ -19,7 +19,7 @@ const SSH_MSG_REQUEST_FAILURE = 82;
 const SSH_MSG_CHANNEL_OPEN = 90;
 const SSH_MSG_CHANNEL_OPEN_CONFIRMATION = 91;
 const SSH_MSG_CHANNEL_OPEN_FAILURE = 92;
-const SSH_MSG_CHANNEL_WINDOW_ADJUST = 94;
+const SSH_MSG_CHANNEL_WINDOW_ADJUST = 93;
 const SSH_MSG_CHANNEL_DATA = 94;
 const SSH_MSG_CHANNEL_EXTENDED_DATA = 95;
 const SSH_MSG_CHANNEL_EOF = 96;
@@ -343,6 +343,7 @@ class SSHConnection {
         this.onData = null;
         this.onClose = null;
         this.onDebug = null;
+        this._sendLock = Promise.resolve();
     }
 
     debug(msg) {
@@ -537,7 +538,7 @@ class SSHConnection {
         
         this.debug(`readRawPacket: len field = ${len} (0x${len.toString(16)}), first 16 bytes: ${Array.from(this.readBuffer.slice(0, 16)).map(b => b.toString(16).padStart(2, '0')).join(' ')}`);
         
-        if (len > 100000 || len < 0) {
+        if (len > 256000 || len < 0) {
             this.debug('Invalid length, clearing buffer and waiting for more data');
             this.readBuffer = new Uint8Array(0);
             return false;
@@ -580,7 +581,7 @@ class SSHConnection {
         
         this.debug(`decryptNextPacket: len=${len}, buffer=${this.readBuffer.length}`);
         
-        if (len > 100000 || len < 0) {
+        if (len > 256000 || len < 0) {
             this.debug('Invalid decrypted length');
             this.incomingCipher.restoreState(savedState);
             return false;
@@ -695,6 +696,7 @@ class SSHConnection {
                 this.handleChannelEof(pkt);
                 break;
             case SSH_MSG_CHANNEL_WINDOW_ADJUST:
+                this.handleWindowAdjust(pkt);
                 break;
             case SSH_MSG_CHANNEL_SUCCESS:
                 this.debug('Channel request succeeded');
@@ -1705,13 +1707,17 @@ class SSHConnection {
     handleChannelOpenConfirmation(pkt) {
         const recipientChannel = pkt.readUint32();
         const senderChannel = pkt.readUint32();
+        const initialWindowSize = pkt.readUint32();
+        const maxPacketSize = pkt.readUint32();
         
-        this.debug(`Channel ${recipientChannel} opened (remote: ${senderChannel})`);
+        this.debug(`Channel ${recipientChannel} opened (remote: ${senderChannel}, window: ${initialWindowSize}, maxPacket: ${maxPacketSize})`);
         
         const ch = this.channels.get(recipientChannel);
         if (ch) {
             ch.pending = false;
             ch.remoteId = senderChannel;
+            ch.remoteWindow = initialWindowSize;
+            ch.maxPacketSize = maxPacketSize;
         }
     }
 
@@ -1742,6 +1748,33 @@ class SSHConnection {
         }
     }
 
+    handleWindowAdjust(pkt) {
+        const recipientChannel = pkt.readUint32();
+        const bytesToAdd = pkt.readUint32();
+        const ch = this.channels.get(recipientChannel);
+        if (ch) {
+            ch.remoteWindow = (ch.remoteWindow || 0) + bytesToAdd;
+            this.debug(`Channel ${recipientChannel} window adjust +${bytesToAdd}, now ${ch.remoteWindow}`);
+            if (ch._windowResolve && ch.remoteWindow > 0) {
+                ch._windowResolve();
+                ch._windowResolve = null;
+                ch._windowPromise = null;
+            }
+        }
+    }
+
+    handleChannelExtendedData(pkt) {
+        const recipientChannel = pkt.readUint32();
+        const dataType = pkt.readUint32();
+        const data = pkt.readString();
+        
+        this.debug(`Channel extended data: recipientChannel=${recipientChannel}, type=${dataType}, data=${data.length} bytes`);
+        
+        if (this.onData && recipientChannel === this.shellChannel) {
+            this.onData(data);
+        }
+    }
+
     handleChannelEof(pkt) {
         const remoteChannelId = pkt.readUint32();
         if (this.onData) {
@@ -1750,6 +1783,24 @@ class SSHConnection {
     }
 
     async sendPacket(payload) {
+        // Serialize all sends to prevent cipher state corruption
+        const prev = this._sendLock;
+        let resolve;
+        this._sendLock = new Promise(r => { resolve = r; });
+        await prev;
+        try {
+            await this._sendPacketInner(payload);
+        } finally {
+            resolve();
+        }
+    }
+
+    async _sendPacketInner(payload) {
+        if (this.ws.readyState !== WebSocket.OPEN) {
+            this.debug(`Cannot send packet: WebSocket state is ${this.ws.readyState}`);
+            return;
+        }
+        
         if (this.state === 'transport' && this.outgoingCipher) {
             const blockSize = 16;
             
@@ -1806,23 +1857,47 @@ class SSHConnection {
         }
     }
 
-    sendData(data) {
+    async sendData(data) {
         if (!this.shellChannel) return;
         
         const ch = this.channels.get(this.shellChannel);
         if (!ch || ch.closed) return;
         
-        const buf = new SSHBuffer();
-        buf.appendByte(SSH_MSG_CHANNEL_DATA);
-        buf.appendInt32(ch.remoteId);
-        
+        let payload;
         if (typeof data === 'string') {
-            buf.appendBuffer(new TextEncoder().encode(data));
+            payload = new TextEncoder().encode(data);
         } else {
-            buf.appendBuffer(data);
+            payload = data;
         }
-        
-        this.sendPacket(buf.toUint8Array());
+
+        // Send in chunks respecting remote window and max packet size
+        const maxChunk = Math.min(ch.maxPacketSize || 32768, 32768);
+        let offset = 0;
+
+        while (offset < payload.length) {
+            // Wait for window space
+            while ((ch.remoteWindow || 0) <= 0) {
+                if (ch.closed) return;
+                if (!ch._windowPromise) {
+                    ch._windowPromise = new Promise(resolve => {
+                        ch._windowResolve = resolve;
+                    });
+                }
+                await ch._windowPromise;
+            }
+
+            const chunkSize = Math.min(maxChunk, payload.length - offset, ch.remoteWindow || maxChunk);
+            const chunk = payload.slice(offset, offset + chunkSize);
+
+            const buf = new SSHBuffer();
+            buf.appendByte(SSH_MSG_CHANNEL_DATA);
+            buf.appendInt32(ch.remoteId);
+            buf.appendBuffer(chunk);
+            
+            await this.sendPacket(buf.toUint8Array());
+            ch.remoteWindow = (ch.remoteWindow || 0) - chunkSize;
+            offset += chunkSize;
+        }
     }
 
     resize(rows, cols) {

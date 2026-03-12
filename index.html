@@ -80,8 +80,48 @@
         }
         #status.connected { color: #48bb78; }
         #status.error { color: #f56565; }
-        #terminal { flex: 1; padding: 10px; }
+        #terminal { flex: 1; padding: 10px; position: relative; }
         .xterm { padding: 5px; }
+        #zmodem-modal {
+            display: none;
+            position: absolute;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,0.7);
+            z-index: 1000;
+            justify-content: center;
+            align-items: center;
+        }
+        #zmodem-modal.active { display: flex; }
+        #zmodem-modal .zmodem-box {
+            background: #2d2d2d;
+            border: 1px solid #555;
+            border-radius: 8px;
+            padding: 30px 40px;
+            text-align: center;
+            color: #d4d4d4;
+        }
+        #zmodem-modal .zmodem-box p {
+            margin: 0 0 15px 0;
+            font-size: 15px;
+        }
+        #zmodem-modal .zmodem-box button {
+            padding: 10px 24px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            margin: 0 6px;
+        }
+        #zmodem-modal .btn-upload {
+            background: #0e639c;
+            color: #fff;
+        }
+        #zmodem-modal .btn-upload:hover { background: #1177bb; }
+        #zmodem-modal .btn-cancel {
+            background: #555;
+            color: #fff;
+        }
+        #zmodem-modal .btn-cancel:hover { background: #666; }
         .auth-methods {
             display: flex;
             align-items: center;
@@ -154,19 +194,26 @@
         <button class="btn btn-disconnect" id="disconnectBtn" onclick="disconnect()" disabled>断开</button>
         <span id="status">未连接</span>
     </div>
-    <div id="terminal"></div>
+    <div id="terminal">
+        <div id="zmodem-modal">
+            <div class="zmodem-box">
+                <p id="zmodem-modal-text">检测到文件上传请求 (rz)，请选择文件</p>
+                <button class="btn-upload" id="zmodem-choose-btn">选择文件</button>
+                <button class="btn-cancel" id="zmodem-cancel-btn">取消</button>
+            </div>
+        </div>
+    </div>
     <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/tweetnacl/1.0.3/nacl-fast.min.js"></script>
-    <script src="ssh.js?v=24"></script>
-    <script src="zmodem.js"></script>
+    <script src="ssh.js?v=25"></script>
+    <script src="zmodem_lib.js?v=2"></script>
     <script>
         let ssh = null;
         let term = null;
         let fitAddon = null;
         let privateKeyData = null;
-        let zmodemReceiver = null;
-        let zmodemActive = false;
+        let zsentry = null;
 
         term = new Terminal({
             cursorBlink: true,
@@ -258,50 +305,144 @@
                 
                 ssh = new SSHConnection(ws);
                 
-                ssh.onData = (data) => {
-                    // data is now Uint8Array
-                    if (zmodemActive) {
-                        zmodemReceiver.feed(data);
-                        return;
-                    }
+                function setupZsentry() {
+                    let zmodemActive = false;
+                    zsentry = new Zmodem.Sentry({
+                        to_terminal: (octets) => {
+                            if (zmodemActive) return;
+                            term.write(new Uint8Array(octets));
+                        },
+                        sender: (octets) => {
+                            return ssh.sendData(new Uint8Array(octets));
+                        },
+                        on_retract: () => {
+                            console.log('[ZMODEM] retract');
+                        },
+                        on_detect: (detection) => {
+                            const zsession = detection.confirm();
+                            zmodemActive = true;
+                            term.write('\r\n');
 
-                    // Detect ZMODEM start sequence
-                    const zIdx = detectZmodem(data);
-                    if (zIdx >= 0) {
-                        // Write any text before the ZMODEM sequence to terminal
-                        if (zIdx > 0) {
-                            term.write(new TextDecoder().decode(data.slice(0, zIdx)));
-                        }
-                        term.write('\r\n\x1b[33m[ZMODEM] 检测到文件传输，开始接收...\x1b[0m\r\n');
-                        zmodemActive = true;
-                        zmodemReceiver = new ZmodemReceiver(
-                            (sendData) => {
-                                ssh.sendData(sendData);
-                            },
-                            (fileName, fileData) => {
-                                term.write(`\r\n\x1b[32m[ZMODEM] 接收完成: ${fileName} (${fileData.length} bytes)\x1b[0m\r\n`);
-                                const blob = new Blob([fileData], { type: 'application/octet-stream' });
-                                const url = URL.createObjectURL(blob);
-                                const a = document.createElement('a');
-                                a.href = url;
-                                a.download = fileName;
-                                a.click();
-                                URL.revokeObjectURL(url);
-                            },
-                            () => {
-                                term.write('\r\n\x1b[33m[ZMODEM] 传输结束\x1b[0m\r\n');
-                                zmodemActive = false;
-                                zmodemReceiver = null;
-                            },
-                            (msg) => {
-                                console.log(msg);
+                            if (zsession.type === 'receive') {
+                                // sz: 服务器发送文件到浏览器
+                                term.write('\x1b[33m[ZMODEM] 检测到文件下载...\x1b[0m\r\n');
+
+                                zsession.on('offer', (xfer) => {
+                                    const detail = xfer.get_details();
+                                    term.write(`\x1b[33m[ZMODEM] 接收: ${detail.name} (${detail.size} bytes)\x1b[0m\r\n`);
+
+                                    xfer.accept().then((payloads) => {
+                                        Zmodem.Browser.save_to_disk(payloads, detail.name);
+                                        term.write(`\x1b[32m[ZMODEM] 下载完成: ${detail.name}\x1b[0m\r\n`);
+                                    }).catch((err) => {
+                                        console.error('[ZMODEM] receive error:', err);
+                                        term.write(`\x1b[31m[ZMODEM] 接收错误: ${err.message || err}\x1b[0m\r\n`);
+                                    });
+                                });
+
+                                zsession.on('session_end', () => {
+                                    zmodemActive = false;
+                                    term.write('\x1b[33m[ZMODEM] 传输结束\x1b[0m\r\n');
+                                    zsentry = null;
+                                    setupZsentry();
+                                });
+
+                                zsession.start();
+
+                            } else {
+                                // rz: 服务器准备接收文件，浏览器上传
+                                term.write('\x1b[33m[ZMODEM] 检测到文件上传请求，请点击弹窗选择文件...\x1b[0m\r\n');
+
+                                const modal = document.getElementById('zmodem-modal');
+                                const chooseBtn = document.getElementById('zmodem-choose-btn');
+                                const cancelBtn = document.getElementById('zmodem-cancel-btn');
+                                modal.classList.add('active');
+
+                                function cleanupModal() {
+                                    modal.classList.remove('active');
+                                    chooseBtn.onclick = null;
+                                    cancelBtn.onclick = null;
+                                }
+
+                                cancelBtn.onclick = () => {
+                                    cleanupModal();
+                                    term.write('\x1b[31m[ZMODEM] 取消传输\x1b[0m\r\n');
+                                    zsession.abort();
+                                    zsentry = null;
+                                    setupZsentry();
+                                };
+
+                                chooseBtn.onclick = () => {
+                                    const input = document.createElement('input');
+                                    input.type = 'file';
+                                    input.multiple = true;
+
+                                    let fileSelected = false;
+                                    input.onchange = (e) => {
+                                        fileSelected = true;
+                                        cleanupModal();
+                                        const files = Array.from(e.target.files);
+                                        if (!files.length) {
+                                            term.write('\x1b[31m[ZMODEM] 未选择文件，取消传输\x1b[0m\r\n');
+                                            zsession.abort();
+                                            zsentry = null;
+                                            setupZsentry();
+                                            return;
+                                        }
+
+                                        Zmodem.Browser.send_files(zsession, files, {
+                                            on_offer_response: (obj, xfer) => {
+                                                if (xfer) {
+                                                    term.write(`\x1b[33m[ZMODEM] 上传: ${obj.name} (${obj.size} bytes)\x1b[0m\r\n`);
+                                                }
+                                            },
+                                            on_progress: (obj, xfer) => {},
+                                            on_file_complete: (obj) => {
+                                                term.write(`\x1b[32m[ZMODEM] 上传完成: ${obj.name}\x1b[0m\r\n`);
+                                            },
+                                        }).then(() => {
+                                            term.write('\x1b[33m[ZMODEM] 传输结束\x1b[0m\r\n');
+                                            zsentry = null;
+                                            setupZsentry();
+                                        }).catch((err) => {
+                                            console.error('[ZMODEM] error:', err);
+                                            term.write(`\x1b[31m[ZMODEM] 错误: ${err.message || err}\x1b[0m\r\n`);
+                                            zsentry = null;
+                                            setupZsentry();
+                                        });
+                                    };
+
+                                    // Handle cancel (user closes picker without selecting)
+                                    window.addEventListener('focus', function cancelHandler() {
+                                        setTimeout(() => {
+                                            if (!fileSelected) {
+                                                cleanupModal();
+                                                term.write('\x1b[31m[ZMODEM] 取消传输\x1b[0m\r\n');
+                                                zsession.abort();
+                                                zsentry = null;
+                                                setupZsentry();
+                                            }
+                                            window.removeEventListener('focus', cancelHandler);
+                                        }, 300);
+                                    }, { once: true });
+
+                                    input.click();
+                                };
                             }
-                        );
-                        zmodemReceiver.feed(data.slice(zIdx));
+                        },
+                    });
+                }
+
+                ssh.onData = (data) => {
+                    if (!zsentry) {
+                        term.write(new TextDecoder().decode(data));
                         return;
                     }
-
-                    term.write(new TextDecoder().decode(data));
+                    try {
+                        zsentry.consume(data.buffer ? Array.from(data) : data);
+                    } catch(e) {
+                        console.error('[ZMODEM] consume error:', e);
+                    }
                 };
                 
                 ssh.onClose = () => {
@@ -329,6 +470,8 @@
                 const rows = term.rows;
                 const cols = term.cols;
                 await ssh.openShell(rows, cols);
+                
+                setupZsentry();
                 
                 setTimeout(() => term.focus(), 100);
                 
