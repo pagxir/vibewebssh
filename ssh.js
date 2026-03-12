@@ -1726,11 +1726,10 @@ class SSHConnection {
         const recipientChannel = pkt.readUint32();
         const data = pkt.readString();
         
-        const text = new TextDecoder().decode(data);
-        this.debug(`Channel data: recipientChannel=${recipientChannel}, shellChannel=${this.shellChannel}, data=${text.length} chars`);
+        this.debug(`Channel data: recipientChannel=${recipientChannel}, shellChannel=${this.shellChannel}, data=${data.length} bytes`);
         
         if (this.onData && recipientChannel === this.shellChannel) {
-            this.onData(text);
+            this.onData(data);
         }
     }
 
